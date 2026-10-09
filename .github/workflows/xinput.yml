@@ -28,6 +28,10 @@ jobs:
         with:
           key: x86_64-pc-windows-msvc
 
+      - name: Update Cargo.lock
+        shell: pwsh
+        run: cargo update --workspace
+
       - name: Build openOMSI
         shell: cmd
         run: scripts\build-windows.cmd x86_64-pc-windows-msvc
@@ -44,4 +48,4 @@ jobs:
           name: openomsi-xinput-test
           path: dist/windows/
           retention-days: 7
-          if-no-files-found: errorS
+          if-no-files-found: error
