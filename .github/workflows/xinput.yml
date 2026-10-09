@@ -30,7 +30,7 @@ jobs:
 
       - name: Update Cargo.lock
         shell: pwsh
-        run: cargo update --workspace
+        run: cargo metadata --format-version 1 > $null
 
       - name: Build openOMSI
         shell: cmd
