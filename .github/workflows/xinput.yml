@@ -1,0 +1,47 @@
+name: Build XInput
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64 MSVC
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: Build openOMSI
+        shell: cmd
+        run: scripts\build-windows.cmd x86_64-pc-windows-msvc
+
+      - name: Show build output
+        shell: powershell
+        run: |
+          Write-Host "dist/windows:"
+          Get-ChildItem -Recurse dist/windows
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: openomsi-xinput-test
+          path: dist/windows/
+          retention-days: 7
+          if-no-files-found: errorS
