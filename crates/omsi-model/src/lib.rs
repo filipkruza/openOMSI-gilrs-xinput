@@ -7,6 +7,12 @@
 use omsi_cfg::{CfgFile, CfgReader, Entry};
 use std::path::{Path, PathBuf};
 
+mod extensions;
+pub use extensions::SpotlightCookie;
+#[cfg(test)]
+mod extension_tests;
+mod pages;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnimOrigin {
     Trans([f32; 3]),
@@ -98,6 +104,11 @@ pub struct MaterialDef {
     /// openOMSI extension: Omsi.exe does not know the keyword, and the classic picture draws
     /// the material as if it were not there.
     pub glow: Option<(String, f32)>,
+    /// `[led_glow_effect] <value>` (openOMSI): how much of an LED panel's glow the slot
+    /// gets, 0..1 - 0 none (a flipdot or an LCD the automatic guess took for LED dots),
+    /// 1 the full `Led glow` setting. The modeller's word replaces the guess the enhanced
+    /// picture otherwise makes from the slot's `\S:n` mask and white light map.
+    pub led_glow: Option<f32>,
     pub allcolor: Option<[f32; 14]>,
 }
 
@@ -117,7 +128,7 @@ impl MaterialDef {
         macro_rules! opt {
             ($($f:ident),*) => { $( if self.$f.is_none() { self.$f = base.$f.clone(); } )* };
         }
-        opt!(envmap, envmap_mask, bumpmap, transmap, raindropmap, texcoord_trans_x, texcoord_trans_y, use_script_texture, use_text_texture, alphascale, freetex, nightmap, glow, allcolor);
+        opt!(envmap, envmap_mask, bumpmap, transmap, raindropmap, texcoord_trans_x, texcoord_trans_y, use_script_texture, use_text_texture, alphascale, freetex, nightmap, glow, led_glow, allcolor);
         self.envmap_realtime |= base.envmap_realtime;
         if self.tex_address == TexAddress::Wrap {
             self.tex_address = base.tex_address;
@@ -165,6 +176,43 @@ pub struct LightEnh2 {
     pub bitmap: Option<String>,
 }
 
+/// One condition of a mesh's visibility (see [`MeshDef::visible_any`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VisibleCond {
+    pub variable: String,
+    /// `[visible]`: the value (met within 0.5 of it, as the original compares); `[visible_range]`:
+    /// the lowest value.
+    pub lo: f32,
+    /// `[visible_range]`: the highest value (both ends included).
+    pub hi: f32,
+    pub range: bool,
+    /// Written `var !`: met when the plain condition is not.
+    pub not: bool,
+}
+
+impl VisibleCond {
+    /// Whether the condition holds with its variable at `x`.
+    pub fn holds(&self, x: f32) -> bool {
+        let met = if self.range { x >= self.lo && x <= self.hi } else { (x - self.lo).abs() < 0.5 };
+        met != self.not
+    }
+}
+
+impl MeshDef {
+    /// The groups of `visible_any` that hold conditions (the mark `||` leaves is not one).
+    pub fn visible_groups(&self) -> impl Iterator<Item = &Vec<VisibleCond>> {
+        self.visible_any.iter().filter(|g| !g.is_empty())
+    }
+
+    /// Whether the mesh is shown with its variables read by `var` (a variable the vehicle
+    /// does not have reads 0); None: the mesh has no condition.
+    pub fn visible_by(&self, var: impl Fn(&str) -> Option<f32>) -> Option<bool> {
+        let mut groups = self.visible_groups().peekable();
+        groups.peek()?;
+        Some(groups.any(|g| g.iter().all(|c| c.holds(var(&c.variable).unwrap_or(0.0)))))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MeshDef {
     pub file: String,
@@ -177,7 +225,16 @@ pub struct MeshDef {
     pub smooth_skin: bool,
     pub anim_parent: Option<String>,
     pub animations: Vec<Animation>,
+    /// `[visible] var value`: the mesh's last plain condition (what the original reads).
     pub visible: Option<(String, f32)>,
+    /// Every visibility condition of the mesh (openOMSI, #729): the mesh is shown when all
+    /// conditions of any one group hold. Several `[visible]` and `[visible_range] var min
+    /// max` blocks of a mesh make one group (all must hold; with plain `[visible]` blocks
+    /// alone the last one counts, as in the original), a variable written with `!`
+    /// after it (`door_open !`) negates its condition, and a line `||` between two blocks
+    /// starts the next group (either may hold). Empty: no condition. (An empty group is
+    /// the mark a `||` leaves before its condition: see [`MeshDef::visible_groups`].)
+    pub visible_any: Vec<Vec<VisibleCond>>,
     pub illumination: Vec<i32>,
     pub illumination_interior: Vec<i32>,
     pub materials: Vec<MaterialDef>,
@@ -203,6 +260,13 @@ pub struct HtmlTextureDef {
     pub width: i32,
     pub height: i32,
     pub path: String,
+    /// `lit`, the word on the line after the page's path: the page is a **surface** - shaded
+    /// by the world's light like every other material - rather than the display such a page
+    /// is by default, drawn unlit at its own brightness, which is what a bus's own panel is.
+    /// The slots that take their picture from this page are drawn lit with it, wherever
+    /// they are - a scenery object's and a vehicle's alike (`Model::html_page_lit`). An
+    /// openOMSI extension: Omsi.exe knows neither part, and draws such a slot unlit.
+    pub lit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -442,6 +506,7 @@ pub struct Model {
     pub particle_emitters: Vec<ParticleEmitter>,
     pub spotlights: Vec<Spotlight>,
     pub spotlights_2: Vec<Spotlight2>,
+    pub spotlight_cookies: Vec<SpotlightCookie>,
     pub interior_lights: Vec<InteriorLight>,
     /// `[light]` legacy lights (raw).
     pub lights: Vec<Vec<String>>,
@@ -490,12 +555,32 @@ impl Model {
                 Entry::Token(t) => m.handle_token(t, &mut r),
             }
         }
+        m.tidy_interior_lamps();
+        m.tidy_visible();
         m
+    }
+
+    pub fn tidy_visible(&mut self) {
+        for m in &mut self.meshes {
+            let groups = m.visible_any.iter().filter(|g| !g.is_empty()).count();
+            if groups == 1 && m.visible_any.iter().flatten().all(|c| !c.range && !c.not) {
+                if let Some(last) = m.visible_any.iter().flatten().last().cloned() {
+                    m.visible_any = vec![vec![last]];
+                }
+            }
+        }
     }
 
     /// Handle one `[newanim]` sub-command line (one of [`ANIM_TOKENS`]): it goes to the
     /// last animation of the current mesh, wherever it stands after the `[newanim]`.
     pub fn handle_token(&mut self, t: &str, r: &mut CfgReader) {
+        // `||` between two `[visible]` blocks: the next conditions are another group (#729)
+        if t == "||" {
+            if let Some(m) = self.meshes.last_mut().filter(|m| m.visible_any.last().is_some_and(|g| !g.is_empty())) {
+                m.visible_any.push(Vec::new());
+            }
+            return;
+        }
         let origin = match t {
             "origin_trans" => Some(AnimOrigin::Trans(r.f32s::<3>())),
             "origin_rot_x" => Some(AnimOrigin::RotX(r.f32())),
@@ -534,8 +619,52 @@ impl Model {
         self.meshes.last_mut()
     }
 
+    /// The material the `matl_*` commands act on: the last one selected - except right after
+    /// a `[matl_change]`, where Omsi.exe goes on with the slot's own material until the first
+    /// `[matl_item]` (0x5efae8: the change keeps the slot's record as the current one, and the
+    /// item later starts as a copy of it). An LED matrix that opens its change first and
+    /// writes `[matl_alpha]` and its script texture after it gives them to the slot itself:
+    /// kept on the change record, the slot stayed opaque and every dot of the panel shone.
+    /// A slot without a `[matl]` of its own gets one here, as Omsi.exe has a record for every
+    /// material of the mesh.
     fn cur_matl(&mut self) -> Option<&mut MaterialDef> {
-        self.meshes.last_mut().and_then(|m| m.materials.last_mut())
+        let mesh = self.meshes.last_mut()?;
+        let (texture, index) = match mesh.materials.last() {
+            Some(d) if !d.item && d.change.is_some() => (d.texture.clone(), d.index),
+            _ => return mesh.materials.last_mut(),
+        };
+        let base = |d: &MaterialDef| !d.item && d.change.is_none() && d.index == index && d.texture.eq_ignore_ascii_case(&texture);
+        let k = match mesh.materials.iter().rposition(base) {
+            Some(k) => k,
+            None => {
+                // (before the change, which stays the last record: the commands after this
+                // one still find it)
+                let at = mesh.materials.len() - 1;
+                mesh.materials.insert(at, MaterialDef { texture, index, ..Default::default() });
+                at
+            }
+        };
+        mesh.materials.get_mut(k)
+    }
+
+    /// `lit`, the word on the line after a page's path (see `HtmlTextureDef::lit`): taken
+    /// when it is there, and only that word - anything else leaves the reader where it was.
+    fn take_lit_flag(r: &mut CfgReader<'_>) -> bool {
+        let mut ahead = r.clone();
+        if ahead.word().eq_ignore_ascii_case("lit") {
+            *r = ahead;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A text texture's full colour flag: Omsi.exe reads it with StrToInt into a byte and
+    /// tests that for non-zero (0x5f0919), so the `255` some add-ons write is set - read as
+    /// "not 1" the glyphs were filled with the RGB that follows (yellow on those fonts).
+    fn text_full_color(r: &mut CfgReader<'_>) -> bool {
+        let w = r.word();
+        w.eq_ignore_ascii_case("true") || omsi_cfg::parse_i32(w) != 0
     }
 
     /// Handle one model.cfg keyword. Returns `false` when the keyword is not part of the
@@ -601,16 +730,17 @@ impl Model {
                 let width = r.i32();
                 let height = r.i32();
                 let path = r.str().to_string();
+                let lit = Self::take_lit_flag(r);
                 let script_index = self.script_textures.len();
                 self.script_textures.push((width, height));
-                self.html_textures.push(HtmlTextureDef { script_index, width, height, path });
+                self.html_textures.push(HtmlTextureDef { script_index, width, height, path, lit });
             }
             "texttexture" => {
                 let variable = r.str().to_string();
                 let font = r.str().to_string();
                 let width = r.i32();
                 let height = r.i32();
-                let full_color = r.bool();
+                let full_color = Self::text_full_color(r);
                 let color = r.f32s::<3>();
                 self.text_textures.push(TextTexture { variable, font, width, height, full_color, color, orientation: 0, grid: 1 });
             }
@@ -625,7 +755,7 @@ impl Model {
                 let font = r.str().to_string();
                 let width = r.i32();
                 let height = r.i32();
-                let full_color = r.bool();
+                let full_color = Self::text_full_color(r);
                 let color = r.f32s::<3>();
                 let extra: Vec<String> = (0..2).map(|_| r.str().to_string()).collect();
                 let orientation = omsi_cfg::parse_i32(&extra[0]);
@@ -713,11 +843,23 @@ impl Model {
                     m.animations.push(Animation::default());
                 }
             }
-            "visible" => {
-                let v = r.str().to_string();
-                let val = r.f32();
+            "visible" | "visible_range" => {
+                // (`var !`: the condition negated, an openOMSI extension like the range)
+                let line = r.str().trim().to_string();
+                let not = line.ends_with('!');
+                let v = line.trim_end_matches('!').trim().to_string();
+                let lo = r.f32();
+                let (hi, range) = if k == "visible_range" { (r.f32(), true) } else { (lo, false) };
                 if let Some(m) = self.cur_mesh() {
-                    m.visible = Some((v, val));
+                    if !range && !not {
+                        m.visible = Some((v.clone(), lo));
+                    }
+                    if m.visible_any.is_empty() {
+                        m.visible_any.push(Vec::new());
+                    }
+                    if let Some(g) = m.visible_any.last_mut() {
+                        g.push(VisibleCond { variable: v, lo: lo.min(hi), hi: lo.max(hi), range, not });
+                    }
                 }
             }
             "illumination" => {
@@ -804,6 +946,7 @@ impl Model {
                 };
                 self.spotlights_2.push(Spotlight2 { values, variable, mirrored });
             }
+            "spotlight_cookie" => self.spotlight_cookies.push(SpotlightCookie::read(r)),
             "interiorlight" => {
                 let variable = r.str().to_string();
                 let range = r.f32();
@@ -811,6 +954,15 @@ impl Model {
                 let pos = r.f32s::<3>();
                 self.interior_lights.push(InteriorLight { variable, range, color, pos });
             }
+            _ => return self.handle_material_keyword(k, r),
+        }
+        true
+    }
+
+    /// `handle_keyword`'s second half: the texture changes, `[matl]` and the commands on the
+    /// material it opened, and the smoke and particle emitters.
+    fn handle_material_keyword(&mut self, k: &str, r: &mut CfgReader) -> bool {
+        match k {
             "texchanges" => self.texchanges.push(r.str().to_string()),
             "matl" => {
                 let texture = r.str().to_string();
@@ -842,7 +994,10 @@ impl Model {
                 // the variant of the preceding [matl_change]: starts as a copy of the base
                 // material, the following matl_* keywords change the variant only
                 if let Some(mesh) = self.cur_mesh() {
-                    if let Some(change) = mesh.materials.last().filter(|m| m.change.is_some()).cloned() {
+                    // (a second item starts from the slot's material as well, not from the
+                    // item before it: 0x5efae8 copies the record the [matl_change] picked)
+                    let open = mesh.materials.last().is_some_and(|m| m.change.is_some());
+                    if let Some(change) = mesh.materials.iter().rev().find(|m| open && m.change.is_some() && !m.item).cloned() {
                         // inherit the plain [matl] of the same slot (alpha, transmap, ...)
                         let base = mesh
                             .materials
@@ -850,11 +1005,12 @@ impl Model {
                             .rev()
                             .find(|m| !m.item && m.change.is_none() && m.texture.eq_ignore_ascii_case(&change.texture) && m.index == change.index)
                             .cloned();
-                        // ... and what the [matl_change] (or the item before) set on top: Omsi.exe
-                        // copies the whole material record into the new item (0x5efae8 ->
-                        // 0x40a058), its free texture, scrolling and border with it. Copied from
-                        // the plain [matl] alone, the SD77's lit roller blind (`lights_stand`)
-                        // lost its destination text and scrolling with the lights on (#1419).
+                        // - with what was set after the [matl_change], which went to that
+                        // [matl] (see `cur_matl`): Omsi.exe copies the whole material record
+                        // into the new item (0x5efae8 -> 0x40a058), its
+                        // free texture, scrolling and border with it. Without them the SD77's
+                        // lit roller blind (`lights_stand`) lost its destination text and
+                        // scrolling with the lights on (#1419).
                         let mut item = change.clone();
                         if let Some(base) = base {
                             item.inherit(&base);
@@ -964,6 +1120,14 @@ impl Model {
                     m.glow = Some((t, v));
                 }
             }
+            "led_glow_effect" => {
+                // (a value out of 0..1 is taken to the nearer end; a line that is no number
+                // reads as 0, as any number of the format does)
+                let v = r.f32();
+                if let Some(m) = self.cur_matl() {
+                    m.led_glow = Some(if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+                }
+            }
             "matl_allcolor" => {
                 let v = r.f32s::<14>();
                 if let Some(m) = self.cur_matl() {
@@ -1065,7 +1229,7 @@ impl Model {
 /// the way it compares keywords (so the EN92 ignition key's tab-indented origin lines, the
 /// BR481 mirrors' `origin_rot_Y` and the F90 lorry's indented, switched-off second rear axle
 /// are free text), anywhere after the `[newanim]` they belong to.
-pub const ANIM_TOKENS: &[&str] = &["origin_trans", "origin_rot_x", "origin_rot_y", "origin_rot_z", "origin_from_mesh", "anim_rot", "anim_trans", "offset", "delay", "maxspeed"];
+pub const ANIM_TOKENS: &[&str] = &["origin_trans", "origin_rot_x", "origin_rot_y", "origin_rot_z", "origin_from_mesh", "anim_rot", "anim_trans", "offset", "delay", "maxspeed", "||"];
 
 /// One `[newtexchangemaster]` of a `[texchanges]` file: the texture name used in the mesh,
 /// the script variable that picks a replacement, and the replacements themselves.
@@ -1107,7 +1271,7 @@ pub fn parse_texchanges(file: &CfgFile) -> Vec<TexChangeMaster> {
                 out.push(TexChangeMaster { texture, variable, entries: Vec::new(), dir: dir.clone() });
             }
             "entries" => {
-                let n = r.usize();
+                let n = r.count();
                 let entries: Vec<String> = (0..n).map(|_| r.str().trim().to_string()).collect();
                 if let Some(m) = out.last_mut() {
                     m.entries = entries;
@@ -1136,6 +1300,31 @@ pub fn load_texchanges(base: &Path, files: &[String]) -> Vec<TexChangeMaster> {
 
 #[cfg(test)]
 mod tests {
+    /// `[visible]` conditions combined (#729): plain `[visible]` blocks alone keep the last,
+    /// with a range they all hold, a `!` turns one round, `||` between blocks gives another
+    /// group; one alone is as before.
+    #[test]
+    fn several_visible_conditions_combine() {
+        let text = "[mesh]\na.o3d\n[visible]\ndoor\n1\n[visible]\nlight\n1\n\n[mesh]\ne.o3d\n[visible_range]\ndoor\n1\n1\n[visible]\nlight\n1\n\n[mesh]\nb.o3d\n[visible_range]\ngear\n1\n4\n\n[mesh]\nc.o3d\n[visible]\ndoor !\n1\n||\n[visible]\nlight\n1\n\n[mesh]\nd.o3d\n[visible]\ndoor\n2\n";
+        let m = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        let vars = |door: f32, light: f32, gear: f32| move |n: &str| match n {
+            "door" => Some(door),
+            "light" => Some(light),
+            "gear" => Some(gear),
+            _ => None,
+        };
+        let shown = |i: usize, d, l, g| m.meshes[i].visible_by(vars(d, l, g)).unwrap();
+        assert!(shown(0, 1.0, 1.0, 0.0) && !shown(0, 1.0, 0.0, 0.0) && shown(0, 0.0, 1.0, 0.0));
+        assert_eq!(m.meshes[0].visible, Some(("light".to_string(), 1.0)));
+        assert!(shown(1, 1.0, 1.0, 0.0) && !shown(1, 1.0, 0.0, 0.0) && !shown(1, 0.0, 1.0, 0.0));
+        assert!(shown(2, 0.0, 0.0, 1.0) && shown(2, 0.0, 0.0, 4.0) && !shown(2, 0.0, 0.0, 5.0) && !shown(2, 0.0, 0.0, 0.0));
+        assert!(shown(3, 0.0, 0.0, 0.0) && shown(3, 1.0, 1.0, 0.0) && !shown(3, 1.0, 0.0, 0.0));
+        assert!(shown(4, 2.0, 0.0, 0.0) && !shown(4, 1.0, 0.0, 0.0));
+        assert_eq!(m.meshes[4].visible, Some(("door".to_string(), 2.0)));
+        assert_eq!(m.meshes[3].visible, Some(("light".to_string(), 1.0)));
+        assert!(m.unknown_keywords.is_empty(), "{:?}", m.unknown_keywords);
+    }
+
 
     #[test]
     fn compatibility_fixture_preserves_material_slots_and_variant_inheritance() {
@@ -1298,6 +1487,20 @@ mod tests {
         assert_eq!(m.set_vars, vec![("lost".to_string(), 1.0)]);
     }
 
+    /// A text texture's full colour flag is set by any non-zero number, as Omsi.exe tests it:
+    /// add-ons that write 255 there drew their texts in the yellow that follows.
+    #[test]
+    fn text_texture_full_colour_flag_is_any_non_zero_value() {
+        let text = |flag: &str| {
+            format!("[texttexture]\nnr\nArial\n256\n32\n{flag}\n255\n255\n0\n[texttexture_enh]\nnr\nArial\n256\n32\n{flag}\n255\n255\n0\n1\n1\n")
+        };
+        for (flag, want) in [("255", true), ("1", true), ("true", true), ("0", false)] {
+            let m = Model::parse(&CfgFile::from_str("model.cfg", &text(flag)));
+            assert!(m.text_textures.iter().all(|t| t.full_color == want), "{flag}");
+            assert_eq!(m.text_textures.len(), 2);
+        }
+    }
+
     /// A `[matl_item]` is a copy of the material before it: the SD77's lit roller blind
     /// keeps its free texture, scrolling and border (#1419).
     #[test]
@@ -1322,6 +1525,27 @@ mod tests {
         assert_eq!(m.html_textures[0].script_index, 1);
         assert_eq!(m.html_textures[0].path, "html\\demo.html");
         assert_eq!(m.meshes[0].materials[0].use_script_texture, Some(1));
+    }
+
+    /// `lit` after a page's path: the page is a surface rather than a display, and the
+    /// keyword after it is still read as a keyword.
+    #[test]
+    fn a_page_can_be_declared_lit() {
+        let text = "[htmltexture]\n800\n480\nhtml\\demo.html\nlit\n\n[mesh]\nx.o3d\n\n[matl]\nx.dds\n0\n[useHtmlTexture]\n0\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        assert_eq!(m.html_textures.len(), 1);
+        assert!(m.html_textures[0].lit, "the word after the path");
+        assert_eq!(m.meshes[0].materials[0].use_script_texture, Some(0), "the slots still bind the page");
+        let text = "[htmltexture]\n800\n480\nhtml\\demo.html\n\n[mesh]\nx.o3d\n\n[matl]\nx.dds\n0\n[useHtmlTexture]\n0\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        assert!(!m.html_textures[0].lit, "without the word it stays a display");
+        assert_eq!(m.meshes[0].materials[0].use_script_texture, Some(0));
+        let text = "[htmltexture]\n64\n32\nsign.html\nlit\n\n[htmltexture]\n64\n32\nother.html\n\n[mesh]\nx.o3d\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        assert!(m.html_textures[0].lit && !m.html_textures[1].lit, "each page has its own word");
+        assert!(m.html_page_lit(0) && !m.html_page_lit(1), "the lookup every consumer asks");
+        assert_eq!(m.html_page(1).map(|p| p.path.as_str()), Some("other.html"));
+        assert!(m.html_page(2).is_none(), "no page of that script index");
     }
 
     /// A tab-indented block (the stock F90 lorry's second rear axle, whose mesh does not

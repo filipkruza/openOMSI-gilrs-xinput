@@ -36,6 +36,7 @@ struct Camera {
     inside2_a: vec4<f32>,
     inside2_b: vec4<f32>,
     inside2_c: vec4<f32>,
+    cookies: array<vec4<f32>, 8>,
 };
 
 // A hash of a lattice point, from its integer bits.
@@ -131,10 +132,13 @@ struct VsOut {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>) -> VsOut {
     var out: VsOut;
-    // the dome rides with the camera; pushed to the far plane (0 with reversed Z)
+    // the dome rides with the camera; pushed onto the far plane (0 with reversed Z), the
+    // depth the pass starts from: its depth test (equal or nearer than that) keeps it to the
+    // pixels nothing was drawn into, when it is drawn after the scenery's depth was laid
+    // (main_pass.rs `encode_sky`)
     let wp = camera.cam_pos.xyz + pos * 4000.0;
     var clip = camera.view_proj * vec4<f32>(wp, 1.0);
-    clip.z = clip.w * 0.000001;
+    clip.z = 0.0;
     out.clip = clip;
     out.dir = pos;
     return out;
@@ -150,6 +154,19 @@ struct VanillaSkyUniform {
 };
 @group(1) @binding(9) var t_vclouds: texture_2d<f32>;
 @group(1) @binding(10) var<uniform> vsky: VanillaSkyUniform;
+@group(1) @binding(11) var t_sun: texture_2d<f32>;
+
+fn vanilla_sun(d: vec3<f32>) -> vec3<f32> {
+    let s = normalize(camera.sun_dir.xyz);
+    let c = dot(d, s);
+    let right = normalize(select(vec3<f32>(s.y, -s.x, 0.0), vec3<f32>(1.0, 0.0, 0.0), length(s.xy) < 1e-4));
+    let up = cross(right, s);
+    let p = d * (3.0 / max(c, 1e-4));
+    let uv = vec2<f32>((dot(p, right) + 0.0803) / 0.1606, (0.0821 - dot(p, up)) / 0.1606);
+    let t = srgb_encode(textureSampleLevel(t_sun, s_sky, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb);
+    let inside = c > 0.0 && all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+    return select(vec3<f32>(0.0), t * vec3<f32>(1.0, 1.0, 0.0), inside);
+}
 
 // The v of the sky textures towards elevation `e` (rad), as Omsi.exe's dome
 // (helper\skybox.x) has it: rings at the horizon, at 45 degrees and at the zenith with v
@@ -220,11 +237,16 @@ fn vanilla_cloud_reach(d: vec3<f32>) -> vec2<f32> {
     if (vsky.cloud.y <= 0.0 || h <= h0 || h <= 0.0) {
         return vec2<f32>(rim, 0.0);
     }
-    // (below the rim the cone's skirt runs down under the horizon, behind the ground: its
-    // rim stands in for it)
-    var r = rim;
-    if (den > 0.0) {
-        r = min((h - h0) / den, rim);
+    // Below the rim the cone's skirt (helper\clouds.o3d goes on down and in under the
+    // horizon) lies so far away that the fog takes it whole: nothing of the clouds shows
+    // there. Every ray below the rim drawn at the rim instead smeared the texture's one row
+    // into upright streaks above the horizon, wherever the ground did not reach that far.
+    if (den <= 0.0) {
+        return vec2<f32>(rim, 0.0);
+    }
+    let r = (h - h0) / den;
+    if (r > rim) {
+        return vec2<f32>(rim, 0.0);
     }
     return vec2<f32>(r, 1.0);
 }
@@ -255,7 +277,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Vanilla+ in linear light
     let encoded = camera.sky_color.w > 0.5;
     let fog = camera.fog.xyz;
-    var col = select(sky, srgb_encode(sky), encoded);
+    let lit = min(srgb_encode(sky) + vanilla_sun(d), vec3<f32>(1.0));
+    var col = select(srgb_decode(lit), lit, encoded);
     col = mix(col, fog, vanilla_haze(v));
     if (reach.y > 0.5) {
         let c = vanilla_clouds(d, fog, ctex, reach.x, encoded);

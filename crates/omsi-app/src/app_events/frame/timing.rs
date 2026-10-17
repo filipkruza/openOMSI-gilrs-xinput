@@ -20,7 +20,7 @@ impl App {
         // OMSI's autosave of the last situation: every five minutes of play
         if !self.paused && self.player.is_some() && self.clock.run_time - self.session.autosave_t >= 300.0 {
             self.session.autosave_t = self.clock.run_time;
-            self.save_last_situation();
+            self.autosave_last_situation();
         }
         // the time of day a script set last frame (the nearer way round the clock)
         // (not with the real-time sync on: the clock stays the device's)
@@ -33,8 +33,10 @@ impl App {
         // summary, the personnel file and the LAN goodbye are not lost
         // the card ran out of memory: fewer textures (the finest levels of the far
         // ones go), before the driver gives the device up
-        if self.renderer.as_ref().is_some_and(|r| r.take_out_of_memory()) {
+        let settling = self.perf.texture_cut_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
+        if self.renderer.as_ref().is_some_and(|r| r.take_out_of_memory()) && !settling {
             if let Some(w) = self.world.as_ref() {
+                self.perf.texture_cut_at = Some(Instant::now());
                 let now = w.texture_budget_bytes();
                 let less = if now == 0 { 600_000_000 } else { (now * 3 / 5).max(300_000_000) };
                 w.set_texture_budget(less);
@@ -51,7 +53,7 @@ impl App {
             crate::platform::exit(event_loop);
             return None;
         }
-        let desktop_vsync = self.settings.vsync && !self.vr_active();
+        let desktop_vsync = self.settings.vsync && !self.vr_active() && !self.optimiser_holds_frame_rate();
         if let (Some(surface), Some(renderer)) = (self.gfx.surface.as_mut(), self.renderer.as_ref()) {
             surface.set_vsync(renderer, desktop_vsync);
         }
@@ -68,15 +70,29 @@ impl App {
         let now = Instant::now();
         let raw_dt = (now - self.last).as_secs_f32();
         self.log_frame(raw_dt);
-        let profiling = omsi_cfg::flags::OMSI_PROFILE.is_set();
-        if profiling && self.perf.cpu_mark.is_some() && self.perf.frame_times.len() < crate::perf_report::MAX_FRAMES {
-            self.perf.frame_times.push(raw_dt);
+        let draws = self.renderer.as_mut().map_or((0, 0), |r| std::mem::take(&mut r.frame_draws));
+        if self.settings.perf_overlay_on() {
+            self.perf.overlay.sample(raw_dt, self.perf.profile.iter().map(|(key, value)| (key.name(), value)), draws);
+        } else if self.perf.overlay.started() {
+            self.perf.overlay.reset();
         }
-        let waited: f64 = ["acquire", "present", "gpu"].iter()
-            .map(|&k| self.perf.profile.get(k).copied().unwrap_or(0.0))
+        let profiling = omsi_cfg::flags::OMSI_PROFILE.is_set();
+        if profiling && self.perf.profile_mark.is_some() && self.perf.frame_times.len() < crate::perf_report::MAX_FRAMES {
+            self.perf.frame_times.push(raw_dt);
+            if self.perf.frame_times.len() <= crate::perf_report::STAGE_FRAMES {
+                let keys = crate::profile_keys::ProfKey::ALL;
+                if self.perf.frame_stages.is_empty() {
+                    self.perf.frame_stages.reserve_exact(crate::perf_report::STAGE_FRAMES * keys.len());
+                }
+                self.perf.frame_stages.extend(keys.iter().map(|&k| (self.perf.profile.get(k) - self.perf.profile_prev.get(k)) as f32));
+            }
+        }
+        let waited: f64 = [crate::profile_keys::ProfKey::Acquire, crate::profile_keys::ProfKey::Present, crate::profile_keys::ProfKey::Gpu].iter()
+            .map(|&k| self.perf.profile.get(k))
             .sum();
         let wait_this_frame = (waited - self.perf.governor_wait_prev).max(0.0) as f32;
         self.perf.governor_wait_prev = waited;
+        self.optimiser_frame(raw_dt, wait_this_frame);
         if self.perf.total_frames > 60 {
             if raw_dt > 0.05 {
                 self.perf.spikes += 1;
@@ -88,7 +104,7 @@ impl App {
                         .perf.profile
                         .iter()
                         .map(|(k, v)| {
-                            (*k, v - self.perf.profile_prev.get(k).copied().unwrap_or(0.0))
+                            (k.name(), v - self.perf.profile_prev.get(k))
                         })
                         .collect();
                     let staged: f64 = parts
@@ -129,11 +145,32 @@ impl App {
                 self.perf.governor = (0.0, 0, 0.0);
                 let free = self.settings.render_scale <= 0.0
                     && (self.settings.max_fps == 0 || self.settings.max_fps >= 50)
-                    && !omsi_cfg::flags::OMSI_FIXED_SCALE.is_set();
+                    && !omsi_cfg::flags::OMSI_FIXED_SCALE.is_set()
+                    && !self.optimiser_holds_frame_rate();
                 if let (Some(r), true) = (self.renderer.as_mut(), free) {
                     let s = r.dynamic_scale();
-                    let step = render_scale_step(fps, wait_share);
+                    let mut step = render_scale_step(fps, wait_share);
+                    // (up only after two readings in a row ask for it, 10 s: a step down
+                    // takes the wait for the card away, and the next reading alone asked
+                    // to go up again - a step up and down every 10 s, each one new targets
+                    // and a full upload of the instances, a stutter every time)
+                    // A step up that the next reading takes back doubles the readings the next
+                    // step up waits for (up to two minutes); one that holds brings them back to
+                    // two. A card at its limit went 85-100-85 % every 10 s for minutes (#2295).
+                    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+                    static UP_READINGS: AtomicU8 = AtomicU8::new(0);
+                    static UP_NEEDED: AtomicU8 = AtomicU8::new(2);
+                    static WENT_UP: AtomicBool = AtomicBool::new(false);
+                    if WENT_UP.load(Relaxed) {
+                        UP_NEEDED.store(if step < 0.0 { UP_NEEDED.load(Relaxed).saturating_mul(2).min(24) } else { 2 }, Relaxed);
+                    }
+                    let ups = if step > 0.0 { UP_READINGS.load(Relaxed).saturating_add(1) } else { 0 };
+                    if step > 0.0 && ups < UP_NEEDED.load(Relaxed) {
+                        step = 0.0;
+                    }
+                    UP_READINGS.store(if step > 0.0 { 0 } else { ups }, Relaxed);
                     r.set_dynamic_scale(s + step);
+                    WENT_UP.store(r.dynamic_scale() > s + 1e-3, Relaxed);
                     if (r.dynamic_scale() - s).abs() > 1e-3 {
                         log::info!("frame rate {fps:.0} fps (presentation wait {:.0}%): the 3D picture is drawn at {:.0} % of the window now", wait_share * 100.0, r.dynamic_scale() * 100.0);
                         self.perf.governor_low = 0;
@@ -196,9 +233,9 @@ impl App {
                 hud.update(r, scene, &lines);
                 if let wgpu::CurrentSurfaceTexture::Success(frame)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(frame) =
-                    s.surface.get_current_texture()
+                    s.acquire()
                 {
-                    let view = frame.texture.create_view(&Default::default());
+                    let view = s.view(&r.device, &frame);
                     let cam = Camera {
                         position: DVec3::ZERO,
                         yaw: 0.0,
@@ -221,7 +258,7 @@ impl App {
                         &lighting,
                     );
                     win.pre_present_notify();
-                    frame.present();
+                    s.present(&r.device, &r.queue, frame);
                 }
             }
             return false;

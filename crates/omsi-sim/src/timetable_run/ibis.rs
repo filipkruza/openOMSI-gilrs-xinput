@@ -156,7 +156,9 @@ pub(crate) fn roller_blind_row(v: &crate::VehicleInstance, hof: &omsi_vehicle::H
 /// The row of the depot file whose destination the bus shows, which a route number set by
 /// hand keeps: a roller blind's - the one picked for it and not turned to yet (`pick`), else
 /// the one it shows ([`roller_blind_row`]; cranked by hand, the IBIS knows nothing of it, and
-/// a route pick turned the blind back to the IBIS's empty row) - else the IBIS's, by its place
+/// a route pick turned the blind back to the IBIS's empty row). A queued electronic
+/// selection is kept too, so changing the line does not overwrite it with the old row.
+/// Otherwise the IBIS's, by its place
 /// in the depot file (by name it was the first of that name), else the first of the IBIS's
 /// code, else the first with a name.
 pub fn shown_destination(
@@ -168,6 +170,9 @@ pub fn shown_destination(
     let index = v.var("IBIS_TerminusIndex").filter(|i| *i >= 0.0).map(|i| i.round() as usize);
     pick.map(|p| p.row)
         .filter(|&i| i < hof.termini.len())
+        .or_else(|| v.pending_destination.as_ref()
+            .filter(|p| p.hof.as_ref() == hof)
+            .map(|p| p.ti))
         .or_else(|| roller_blind_row(v, hof))
         .or_else(|| index.filter(|&i| hof.termini.get(i).is_some_and(|t| t.code == code)))
         .or_else(|| hof.termini.iter().position(|t| t.code == code))
@@ -495,6 +500,33 @@ pub(crate) fn routes_to(hof: &omsi_vehicle::Hof, line: &str, codes: &[i32]) -> V
         .collect()
 }
 
+/// Whether the depot file runs a trip without a line number to `terminus` through `stops`
+/// as a public trip: it has a route of line 000 (`[infosystem_trip]` 000xx) to that
+/// terminus that starts at the trip's first stop and calls at another of its stops. A works
+/// trip from the depot has none.
+pub fn serves_unnumbered(hof: &omsi_vehicle::Hof, terminus: &str, stops: &[&str]) -> bool {
+    let rows = termini_named(hof, terminus);
+    let codes: Vec<i32> = rows.iter().map(|&i| hof.termini[i].code).collect();
+    let routes: Vec<usize> = hof
+        .info_trips
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.code.trim().parse::<u32>().is_ok_and(|c| c / 100 == 0) && codes.contains(&omsi_cfg::parse_i32(&t.route)))
+        .map(|(i, _)| i)
+        .collect();
+    let trip: Vec<(String, Vec<String>)> = stops
+        .iter()
+        .map(|s| (s.trim().to_lowercase(), stop_words(s)))
+        .filter(|(s, _)| !s.is_empty())
+        .collect();
+    routes.iter().any(|&r| {
+        let list = hof.info_busstop_lists.get(r).map(|l| l.as_slice()).unwrap_or(&[]);
+        let names: Vec<Vec<(String, Vec<String>)>> = list.iter().map(|id| ident_names(hof, id)).collect();
+        let starts = matches!((names.first(), trip.first()), (Some(n), Some(t)) if same_stop(n, t));
+        starts && trip.iter().skip(1).any(|t| names.iter().skip(1).any(|n| same_stop(n, t)))
+    })
+}
+
 /// Which of `routes` a trip through `stops` (the timetable's station names) runs: one
 /// starting at the trip's first stop (the IBIS starts its count there), of those the one
 /// that has most of the trip's stops in the trip's order, then the one as long as the trip
@@ -642,6 +674,38 @@ pub(crate) fn set_destination(
     set_destination_at(v, hof, line, ti, stops, player)
 }
 
+/// The newest destination waiting for an electronic display's current transition.
+pub(crate) struct PendingDestination {
+    hof: std::sync::Arc<omsi_vehicle::Hof>,
+    line: String,
+    ti: usize,
+    stops: Vec<String>,
+    player: bool,
+}
+
+fn destination_transition_active(v: &crate::VehicleInstance) -> bool {
+    v.ty.program.trigger("ai_scheduled_settarget").is_some()
+        && !has_roller_blind(v)
+        && ["LW_req_ziel_change", "Matrix_ziel_animationtimer"]
+            .iter()
+            .any(|name| v.var(name).is_some_and(|timer| timer > 0.0))
+}
+
+/// Called before a script frame, so the previous transition gets its final frame
+/// before the newest request starts a fresh, complete transition.
+pub(crate) fn apply_pending_destination(v: &mut crate::VehicleInstance) {
+    if v.pending_destination.is_none() || destination_transition_active(v) {
+        return;
+    }
+    let pending = v.pending_destination.take().unwrap();
+    // A depot change makes the old row meaningless to the vehicle's scripts.
+    if v.host.hof.as_deref() != Some(pending.hof.as_ref()) {
+        return;
+    }
+    let stops: Vec<&str> = pending.stops.iter().map(String::as_str).collect();
+    set_destination_at(v, &pending.hof, &pending.line, pending.ti, &stops, pending.player);
+}
+
 /// [`set_destination`] with the depot file's terminus `ti` itself.
 pub(crate) fn set_destination_at(
     v: &mut crate::VehicleInstance,
@@ -652,6 +716,24 @@ pub(crate) fn set_destination_at(
     player: bool,
 ) {
     let Some(term) = hof.termini.get(ti) else { return };
+    if destination_transition_active(v) {
+        // Keep script inputs unchanged until the current animation finishes. Replacing
+        // this single slot coalesces rapid selections instead of animating every one.
+        let hof = v.host.hof.as_ref()
+            .filter(|h| h.as_ref() == hof)
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(hof.clone()));
+        v.pending_destination = Some(PendingDestination {
+            hof,
+            line: line.to_string(),
+            ti,
+            stops: stops.iter().map(|s| s.to_string()).collect(),
+            player,
+        });
+        return;
+    }
+    // An immediate selection supersedes an older request that has not been flushed yet.
+    v.pending_destination = None;
     let code = term.code;
     let route_index = pick_route(hof, &routes_to(hof, line, &[code]), stops);
     let line_num = line_number_digits(line).parse::<f32>().unwrap_or(0.0);
@@ -720,23 +802,4 @@ pub(crate) fn set_destination_at(
         "IBIS_terminus_texture",
         hof.termini[ti].texture_id.clone(),
     );
-}
-
-/// What a bus's displays call its terminus: the depot file's first string for it (what the
-/// IBIS shows, in capitals - the stock departure display's font has no small letters, and
-/// the trip's "Bauernhof" came out as a lone "B"), else the timetable's name in capitals
-/// (a train has no depot file).
-pub fn terminus_text(hof: Option<&omsi_vehicle::Hof>, terminus: &str) -> String {
-    let name = terminus.trim();
-    hof.and_then(|h| {
-        h.termini.iter().find(|t| {
-            t.texture_id.trim().eq_ignore_ascii_case(name)
-                || t.strings
-                .iter()
-                .any(|s| s.trim().eq_ignore_ascii_case(name))
-        })
-    })
-        .and_then(|t| t.strings.first())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| name.to_uppercase())
 }

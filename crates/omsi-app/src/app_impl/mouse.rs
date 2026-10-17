@@ -53,6 +53,11 @@ impl App {
     /// the view in the bus), or with OMSI's `[altView]` turns the view; the middle button
     /// turns it in any case. Where there is nothing to zoom it turns the view.
     pub(crate) fn on_right(&mut self, pressed: bool) {
+        if let Some(ph) = self.photo.as_mut() {
+            ph.looking = pressed;
+            self.sync_look_hold();
+            return;
+        }
         self.input.buttons_held.1 = pressed;
         // the left button already down on nothing it works: both held zoom
         if pressed && self.input.buttons_held.0 && !self.input.dragging && self.start_both_drag() {
@@ -75,23 +80,59 @@ impl App {
             self.service_msg = Some(("Mouse steering off".into(), 3.0));
         }
         if pressed && self.right_zooms() && self.start_both_drag() {
+            self.sync_look_hold();
             return;
         }
-        if self.input.mouse_drive && self.menus.game_menu.is_none() {
+        // The wheel and the pedals keep their own point, `mouse_grab.at`, while the view turns.
+        // Where the cursor is held while the mouse steers (the steering cross shows the point)
+        // it is not put back where the look began - that was the cursor's jump as the button
+        // came up - its movement only counts afresh from where it is. Where the free cursor
+        // itself shows the point (`mouse_hold` off) it goes back there, so the two agree.
+        if self.input.mouse_drive && self.menus.game_menu.is_none() && self.input.look_lock.is_none() {
             if pressed {
                 self.input.steer_cursor = Some(self.input.cursor);
             } else if let Some((x, y)) = self.input.steer_cursor.take() {
-                self.input.cursor = (x, y);
-                if let Some(win) = self.window.as_ref() {
-                    let _ = win.set_cursor_position(winit::dpi::PhysicalPosition::new(x as f64, y as f64));
+                if self.settings.mouse_hold {
+                    self.input.mouse_grab.pause();
+                } else {
+                    self.input.cursor = (x, y);
+                    if let Some(win) = self.window.as_ref() {
+                        let _ = win.set_cursor_position(winit::dpi::PhysicalPosition::new(x as f64, y as f64));
+                    }
                 }
             }
         }
         self.input.mouse_look = pressed;
-        // (looking round goes by the cursor: it is let go at once, and held again after)
+        // (looking round locks the cursor where it stands, or lets the steering's hold go
+        // where it cannot, and holds it again after)
+        self.sync_look_hold();
         self.sync_mouse_grab();
         // (the cursor shows it at once, not with the next look at what is under it)
         self.update_hover();
+    }
+
+    /// The mouse's own movement (dx, dy) while looking round with the cursor locked
+    /// (`sync_look_hold`): in logical pixels (points on macOS), at the cursor's rate - the
+    /// field of view over 78.75 per pixel, as Omsi.exe turns the view by the cursor's way.
+    /// False when the look does not go by it (the raw look of the free camera and on foot).
+    pub(crate) fn look_raw(&mut self, dx: f32, dy: f32) -> bool {
+        if self.input.look_lock.is_none() {
+            return false;
+        }
+        if let Some(ph) = self.photo.as_mut() {
+            if ph.looking {
+                let k = look_deg_per_px(ph.cam.fov_deg) * self.settings.look_sens;
+                ph.look(dx * k, dy * k);
+            }
+            return true;
+        }
+        if !self.cursor_looks() {
+            return false;
+        }
+        let fov = self.camera.as_ref().map(|c| c.fov_deg).unwrap_or(60.0);
+        let k = look_deg_per_px(fov) * self.settings.look_sens;
+        self.look_by(dx * k, dy * k);
+        true
     }
 
     pub(crate) fn on_mouse_moved(&mut self, x: f32, y: f32) {
@@ -104,7 +145,7 @@ impl App {
     /// steering's point stands in it.
     pub(super) fn cursor_moved_to(&mut self, x: f32, y: f32) {
         // a plugin's slider or panel being dragged follows the cursor
-        if self.plugin_drag_move(x, y) {
+        if self.integrations.plugin_drag_move(x, y) || self.game_panel_drag(x) {
             self.input.cursor = (x, y);
             return;
         }
@@ -125,11 +166,17 @@ impl App {
     }
 
     fn html_move(&mut self) {
+        let sim = self.player_to_drawn_pose();
+        self.html_move_now();
+        self.player_back_to_sim_pose(sim);
+    }
+
+    fn html_move_now(&mut self) {
         if let Some((id, page, ..)) = self.input.html_object_pressed {
             let Some((o, d, _)) = self.cursor_ray_now() else { return };
             let Some(w) = self.world.clone() else { return };
             if let Some(h) = w.html_object_hit(o, d, HTML_OBJECT_REACH).filter(|h| h.map_id == id && h.page == page) {
-                w.html_object_pointer(id, page, h.u, h.v, omsi_sim::htmltex::PointerKind::Move);
+                w.html_object_pointer(&mut self.session.scenery, id, page, h.u, h.v, omsi_sim::htmltex::PointerKind::Move);
                 self.input.html_object_pressed = Some((id, page, h.u, h.v));
             }
             return;
@@ -137,8 +184,8 @@ impl App {
         let Some((page, ..)) = self.input.html_pressed else { return };
         let Some((o, d, _)) = self.cursor_ray_now() else { return };
         let Some(p) = self.player.as_mut() else { return };
-        if let Some((pg, u, v)) = p.html_hit(o, d).filter(|h| h.0 == page) {
-            p.html_pointer(pg, u, v, omsi_sim::htmltex::PointerKind::Move);
+        if let Some((pg, u, v)) = p.html_hit(o, d, &self.integrations.plugin_pointer).filter(|h| h.0 == page) {
+            p.html_pointer(pg, u, v, omsi_sim::htmltex::PointerKind::Move, &mut self.integrations.plugin_pointer);
             self.input.html_pressed = Some((pg, u, v));
         }
     }
@@ -207,6 +254,17 @@ impl App {
     /// editor's drag, the city map) and no switch is to be named.
     fn move_cursor(&mut self, x: f32, y: f32) -> bool {
         let last = self.input.cursor;
+        self.shell.pointer(x, y);
+        // the photo camera turned by a drag (and nothing else of the game's under the mouse)
+        if let Some(ph) = self.photo.as_mut() {
+            self.input.cursor = (x, y);
+            if ph.looking && self.input.look_lock.is_none() {
+                let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0).max(0.1);
+                let k = look_deg_per_px(ph.cam.fov_deg) * self.settings.look_sens;
+                ph.look((x - last.0) / scale * k, (y - last.1) / scale * k);
+            }
+            return false;
+        }
         self.input.cursor = (x, y);
         // the navigator held by the mouse follows it
         if let Some(n) = self.menus.navigator.as_mut() {
@@ -318,7 +376,7 @@ impl App {
         // (0x82c5f8: yaw and pitch at the press plus the cursor's way times fov / 78.75):
         // raw device deltas are no window pixels (a tablet, a remote desktop or a VM
         // reports positions there and spun the view) and did not follow the zoom
-        if self.cursor_looks() {
+        if self.cursor_looks() && self.input.look_lock.is_none() {
             let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0).max(0.1);
             let fov = self.camera.as_ref().map(|c| c.fov_deg).unwrap_or(60.0);
             let k = look_deg_per_px(fov) * self.settings.look_sens;
@@ -343,6 +401,12 @@ impl App {
     }
 
     pub(crate) fn on_left(&mut self, pressed: bool) {
+        let sim = self.player_to_drawn_pose();
+        self.left_now(pressed);
+        self.player_back_to_sim_pose(sim);
+    }
+
+    fn left_now(&mut self, pressed: bool) {
         if self.xr.vr_nav_edit.is_some() { return; }
         // the object editor: the mouse picks and drags
         if self.menus.game_menu.is_none() && self.editor_mouse(pressed) {
@@ -355,9 +419,9 @@ impl App {
         if let Some(n) = self.menus.navigator.as_mut() {
             if n.map_open() {
                 let ctrl = self.input.keys.contains(&KeyCode::ControlLeft) || self.input.keys.contains(&KeyCode::ControlRight);
-                if pressed && (ctrl || self.menus.teleport_pick) {
-                    // Ctrl+click (or a click after Esc → Move the bus): the bus to the street
-                    // nearest that point, as OMSI's map window places vehicles
+                if pressed && ctrl {
+                    // Ctrl+click: the bus to the street nearest that point, as OMSI's map
+                    // window places vehicles
                     if let Some(at) = n.map_point(x, y) {
                         if std::mem::take(&mut self.menus.teleport_pick) {
                             n.toggle_map();
@@ -366,8 +430,16 @@ impl App {
                     }
                 } else if pressed {
                     n.map_press(x, y);
-                } else {
-                    n.map_release();
+                } else if n.map_release() && self.menus.teleport_pick {
+                    // after Esc → Move the bus the map is dragged to the place as ever, and
+                    // the click that lets go where it was pressed puts the bus there (the
+                    // press used to put it at once, so only what the map showed could be
+                    // chosen)
+                    if let Some(at) = n.map_point(x, y) {
+                        self.menus.teleport_pick = false;
+                        n.toggle_map();
+                        self.place_bus_at(at);
+                    }
                 }
                 return;
             }
@@ -386,6 +458,11 @@ impl App {
                         let at = n.placement();
                         self.settings.navigator_corner = at.clone();
                         crate::game_lists::remember_setting("navigator_corner", &at);
+                        // (and its size, when it was pulled at its corner)
+                        if (n.size - self.settings.nav_size).abs() > 1e-3 {
+                            self.settings.nav_size = n.size;
+                            crate::game_lists::remember_setting("nav_size", &format!("{:.2}", n.size));
+                        }
                         return;
                     }
                     None => {}
@@ -429,6 +506,9 @@ impl App {
         if self.html_object_click(pressed) {
             return;
         }
+        if self.scenery_object_click_event(pressed) {
+            return;
+        }
         // on foot: the own bus's switches, doors and flaps from inside it or standing by it
         if self.view == "foot" && !self.foot_reaches_bus() {
             return;
@@ -451,9 +531,9 @@ impl App {
             let (dx, dy) = std::mem::take(&mut self.input.drag_delta);
             p.occlude_controls = self.view == "outside";
             if pressed {
-                if let Some((page, u, v)) = p.html_hit(o, d) {
+                if let Some((page, u, v)) = p.html_hit(o, d, &self.integrations.plugin_pointer) {
                     p.release();
-                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Down);
+                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Down, &mut self.integrations.plugin_pointer);
                     self.input.html_pressed = Some((page, u, v));
                     self.input.dragging = false;
                     return;
@@ -465,13 +545,20 @@ impl App {
                     self.input.dragging = false;
                     return;
                 }
+                // a coin of the change on the tray: picked up again
+                if let Some((m, k)) = self.session.humans.as_mut().and_then(|h| h.sim.money.as_mut()).and_then(|m| crate::money::change_hit(m, o, d, &p.vehicle).map(|k| (m, k))) {
+                    log::info!("a coin of the change picked up again");
+                    m.take_coin(k);
+                    self.input.dragging = false;
+                    return;
+                }
                 self.input.dragging = p
                     .click(o, d, spread)
                     .is_some();
             } else {
                 if let Some((page, u, v)) = self.input.html_pressed.take() {
-                    let (u, v) = p.html_hit(o, d).filter(|h| h.0 == page).map_or((u, v), |h| (h.1, h.2));
-                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Up);
+                    let (u, v) = p.html_hit(o, d, &self.integrations.plugin_pointer).filter(|h| h.0 == page).map_or((u, v), |h| (h.1, h.2));
+                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Up, &mut self.integrations.plugin_pointer);
                     self.input.dragging = false;
                     return;
                 }
@@ -489,6 +576,17 @@ impl App {
                 self.input.dragging = false;
             }
         }
+        // the map camera (F4): a click on the ground that worked nothing of the bus asks
+        // whether to move the bus there (`game_panels::move_here`)
+        if pressed && self.view == "free" && !self.cam.ego && !self.input.dragging && self.menus.game_menu.is_none() && !self.mouse_steering_now() {
+            if self.player.as_ref().is_some_and(|p| crate::rail_drive::is_rail(&p.vehicle.ty.def)) {
+                return;
+            }
+            let hit = self.cursor_ray_now().zip(self.world.clone()).and_then(|((o, d, _), w)| crate::placing::ground_hit(&w, o, d.as_dvec3(), 2000.0));
+            if let Some(at) = hit {
+                crate::game_panels::ask_move(self, at);
+            }
+        }
     }
 
     /// A click on a page of a scenery object (`[htmltexture]` in its model). True when the
@@ -503,7 +601,7 @@ impl App {
                 .and_then(|(o, d, _)| w.html_object_hit(o, d, HTML_OBJECT_REACH))
                 .filter(|h| h.map_id == id && h.page == page)
                 .map_or((u, v), |h| (h.u, h.v));
-            w.html_object_pointer(id, page, u, v, omsi_sim::htmltex::PointerKind::Up);
+            w.html_object_pointer(&mut self.session.scenery, id, page, u, v, omsi_sim::htmltex::PointerKind::Up);
             self.input.dragging = false;
             return true;
         }
@@ -521,14 +619,50 @@ impl App {
         if let Some(p) = self.player.as_mut() {
             p.release();
         }
-        w.html_object_pointer(h.map_id, h.page, h.u, h.v, omsi_sim::htmltex::PointerKind::Down);
+        w.html_object_pointer(&mut self.session.scenery, h.map_id, h.page, h.u, h.v, omsi_sim::htmltex::PointerKind::Down);
         self.input.html_object_pressed = Some((h.map_id, h.page, h.u, h.v));
         self.input.dragging = false;
         true
     }
 
+    /// A left click (or let go) over a scenery object carrying a `[mouseevent]`.
+    fn scenery_object_click_event(&mut self, pressed: bool) -> bool {
+        let Some(w) = self.world.as_ref() else { return false };
+        if !pressed {
+            if let Some((map_id, ev)) = self.input.pressed_scenery_object.take() {
+                w.scenery_object_release(&mut self.session.scenery, map_id, &ev);
+                self.input.dragging = false;
+                return true;
+            }
+            return false;
+        }
+        let Some((o, d, spread)) = self.cursor_ray_now() else { return false };
+        let veh_has_control = if self.view == "foot" && !self.foot_reaches_bus() {
+            false
+        } else {
+            self.player.as_ref().is_some_and(|p| {
+                p.pick(o, d, spread).is_some() || p.pick_trailer(o, d, spread).is_some()
+            })
+        };
+        if veh_has_control {
+            return false;
+        }
+        let Some(hit) = w.scenery_object_hit(o, d, crate::input_script::SCENERY_OBJECT_REACH, spread) else { return false };
+        if self.player.as_ref().and_then(|p| p.opaque_body_hit(o, d)).is_some_and(|t| t < hit.t) {
+            return false;
+        }
+        if let Some(p) = self.player.as_mut() {
+            p.release();
+        }
+        self.input.drag_delta = (0.0, 0.0);
+        w.scenery_object_click(&mut self.session.scenery, hit.map_id, &hit.event);
+        self.input.pressed_scenery_object = Some((hit.map_id, hit.event));
+        self.input.dragging = true;
+        true
+    }
+
     /// The ray under the cursor now (see [`Self::cockpit_cursor_ray`]).
-    fn cursor_ray_now(&self) -> Option<(glam::DVec3, glam::Vec3, f32)> {
+    pub(crate) fn cursor_ray_now(&self) -> Option<(glam::DVec3, glam::Vec3, f32)> {
         let (cam, s) = self.camera.as_ref().zip(self.gfx.surface.as_ref())?;
         Some(self.cockpit_cursor_ray(cam, (s.config.width, s.config.height)))
     }
@@ -548,7 +682,11 @@ impl App {
             return;
         }
         let (dx, dy) = std::mem::take(&mut self.input.drag_delta);
-        if let Some(p) = self.player.as_mut() {
+        if let Some((map_id, ref ev)) = self.input.pressed_scenery_object {
+            if let Some(w) = self.world.as_ref() {
+                w.scenery_object_drag(&mut self.session.scenery, map_id, ev, dx, dy);
+            }
+        } else if let Some(p) = self.player.as_mut() {
             p.drag(dx, dy);
         }
     }

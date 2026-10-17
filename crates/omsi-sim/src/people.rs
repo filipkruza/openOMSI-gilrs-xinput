@@ -59,25 +59,35 @@ pub mod pednet;
 pub mod spawn;
 pub mod populate;
 pub mod buses;
+pub mod door_requests;
+pub mod bus_view;
+pub use bus_view::{CabinView, PlayerBusView};
 pub mod tick;
 pub mod walk;
 pub mod report;
 pub mod avatar;
 pub mod mirror;
+pub mod scratch;
 // The passengers, as Omsi.exe runs them.
 pub mod pax;
 pub mod pax_stops;
 pub mod pax_tick;
 pub mod pax_task;
 pub mod pax_driver;
+pub mod ticket_hook;
 // What the renderer has to follow, the money on the desk and what the people need of the map.
 pub mod bodies;
+pub mod pose_facts;
 pub mod money;
 pub mod world;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod population_limit_tests;
+#[cfg(test)]
+mod ticket_hook_tests;
+#[cfg(test)]
+mod bad_driving_tests;
 
 use avatar::*;
 use cabin::*;
@@ -88,11 +98,14 @@ use pednet::*;
 // The module's API, at the paths it always had in omsi-app (some only returned, never named
 // outside).
 pub use avatar::{AvatarCmd, SeatSpot};
+pub use door_requests::DoorRequest;
 pub use bodies::{BodyOp, BodyOps};
 pub use mirror::{placed_bus_id, remote_bus_id, remote_bus_player, LanPerson, MirrorPose};
 pub use model::{BusId, DoorWants, Eye, Footfall, PeopleSim, Person, Place, State, VoiceLine};
 pub use money::Money;
+pub use pose_facts::PoseFacts;
 pub use pax::DutyTrip;
+pub use ticket_hook::{TicketAsk, TicketChange};
 pub use world::World;
 
 /// The map's traffic keeps left (its stops are on the left): see the doors of `Cabin`.

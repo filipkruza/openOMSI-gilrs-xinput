@@ -3,13 +3,12 @@
 
 use super::*;
 use crate::scene::World;
-use omsi_render::{Renderer, Scene};
 
 impl Traffic {
     /// Draw the host's traffic from now on (`on`), or simulate our own again: either way
     /// every car there is now goes (ours make room for the host's, the host's copies
     /// cannot drive on by themselves).
-    pub fn set_mirror(&mut self, view: &mut TrafficView, world: &World, renderer: &Renderer, scene: &mut Scene, on: bool) {
+    pub fn set_mirror(&mut self, on: bool) {
         if self.sim.mirror == on {
             return;
         }
@@ -22,7 +21,7 @@ impl Traffic {
         }
         let ids: Vec<u64> = self.sim.cars.iter().map(|c| c.id).collect();
         for id in ids {
-            self.remove_car(view, world, renderer, scene, id);
+            self.remove_car(id);
         }
         self.sim.initial = !on;
         log::info!(
@@ -39,26 +38,31 @@ impl Traffic {
     #[allow(clippy::too_many_arguments)]
     pub fn add_mirror_car(
         &mut self,
-        view: &mut TrafficView,
         world: &World,
-        renderer: &Renderer,
-        scene: &mut Scene,
         id: u64,
         ty: Arc<VehicleType>,
         scheme: Option<usize>,
-        scheduled: bool,
+        context: &omsi_net::ai_context::Context,
+        hof: Option<Arc<omsi_vehicle::Hof>>,
         pos: DVec3,
         heading: f64,
     ) -> usize {
         let mut host = omsi_sim::VehicleHost::new(omsi_sim::SimClock::default());
+        host.remote_sound_triggers = true;
         host.font_lib = Some(world.fonts.clone());
+        host.hof = hof;
+        if let Some((_, wind, street)) = &self.script_environment {
+            host.wind = *wind;
+            host.street_cond = *street;
+        }
+        crate::lan_world::apply_ai_context(&mut host, context);
         let scheme = scheme.filter(|i| *i < ty.paint_schemes.len());
         host.paint_scheme = Some(scheme);
         let mut vehicle = VehicleInstance::new(ty.clone(), host);
         // (the host's poses say where it stands; nothing here pulls it onto the ground)
         vehicle.ground = None;
         vehicle.apply_paint_vars(scheme);
-        let render = self.new_car_render(world, renderer, scene, &mut vehicle, &ty, scheme);
+        let trailers = self.attach_trailers(&mut vehicle, scheme);
         if !ty.model.text_textures.is_empty() {
             vehicle.init_text_textures(&mut world.fonts.lock(), &|p| {
                 omsi_texture::decode_file(p)
@@ -84,13 +88,15 @@ impl Traffic {
             ignore_lead: None,
             crawl: 0.0,
             progress: (0.0, 0.0),
-            bus: scheduled.then(|| Box::new(BusService::new(Vec::new()))),
+            bus: (context.active > 0.5).then(|| Box::new(BusService::new(Vec::new()))),
             half_width,
             yielding: false,
             exit_wait: false,
             light_hold: false,
+            since_player_at_light: f32::MAX,
             reserved: Vec::new(),
             amber: None,
+            amber_start: false,
             passing: None,
             gone: false,
             fresh: 0.0,
@@ -111,14 +117,24 @@ impl Traffic {
             pull_out: 0.0,
             rail_trail: Default::default(),
             ai_secs: 0.0,
+            script_owed: 0.0,
             consist_reversed: false,
             waits_on: None,
             yield_to: None,
-            deadlock_pass: f32::MIN,
-            deadlock_tried: f32::MIN,
+            sideways: Default::default(),
+            yield_pass: f32::MIN,
+            tail_claims: Vec::new(),
+            tail: 0.0,
+            exit_claim: None,
+            holds: Vec::new(),
+            courtesy: false,
+            horn: Default::default(),
+            make_way: None,
             park: None,
+            guard: Default::default(),
         });
-        view.insert(id, render);
+        self.looks.forget(id);
+        self.events.push(TrafficEvent::Spawned { id, ty: ty.clone(), scheme, trailers });
         self.sim.cars.len() - 1
     }
 

@@ -4,11 +4,14 @@
 
 use super::*;
 
-mod batch;
+pub(crate) mod batch;
 mod cull;
 mod effects;
+mod headlamp_shadow;
 mod main_pass;
 mod post;
+mod precip_map;
+pub(crate) use precip_map::*;
 mod prepass;
 mod setup;
 mod shadow;
@@ -16,6 +19,8 @@ mod shadow_plan;
 mod submit;
 
 pub(crate) use batch::DrawPlan;
+pub(crate) use headlamp_shadow::{headlamp_shadow, lamp_shadow_code, own_headlamp, VehicleBox};
+pub(crate) use shadow::LampTiles;
 pub(crate) use shadow_plan::ShadowPlan;
 
 /// The frame's switches from the environment: read once at the start of every frame
@@ -33,6 +38,7 @@ pub(crate) struct FrameEnv {
     pub no_ao: bool,
     pub shadow_near_every_frame: bool,
     pub shadow_far_every_frame: bool,
+    pub lamp_shadows_every_frame: bool,
     pub debug_shadow_far: bool,
     pub debug_view_lamps: bool,
     pub debug_sky: bool,
@@ -51,6 +57,8 @@ pub(crate) struct FrameEnv {
     pub no_main_split: bool,
     pub no_smoke: bool,
     pub no_snowfall: bool,
+    pub no_rain: bool,
+    pub no_precip_roof: bool,
     pub no_coronas: bool,
     pub no_glare: bool,
     pub debug_fog_lamps: bool,
@@ -71,6 +79,7 @@ impl FrameEnv {
             no_ao: omsi_cfg::flags::OMSI_NO_AO.is_set(),
             shadow_near_every_frame: omsi_cfg::flags::OMSI_SHADOW_NEAR_EVERY_FRAME.is_set(),
             shadow_far_every_frame: omsi_cfg::flags::OMSI_SHADOW_FAR_EVERY_FRAME.is_set(),
+            lamp_shadows_every_frame: omsi_cfg::flags::OMSI_LAMP_SHADOWS_EVERY_FRAME.is_set(),
             debug_shadow_far: omsi_cfg::flags::OMSI_DEBUG_SHADOW_FAR.is_set(),
             debug_view_lamps: omsi_cfg::flags::OMSI_DEBUG_VIEW_LAMPS.is_set(),
             debug_sky: omsi_cfg::flags::OMSI_DEBUG_SKY.is_set(),
@@ -87,6 +96,8 @@ impl FrameEnv {
             no_main_split: omsi_cfg::flags::OMSI_NO_MAIN_SPLIT.is_set(),
             no_smoke: omsi_cfg::flags::OMSI_NO_SMOKE.is_set(),
             no_snowfall: omsi_cfg::flags::OMSI_NO_SNOWFALL.is_set(),
+            no_rain: omsi_cfg::flags::OMSI_NO_RAIN.is_set(),
+            no_precip_roof: omsi_cfg::flags::OMSI_NO_PRECIP_ROOF.is_set(),
             no_coronas: omsi_cfg::flags::OMSI_NO_CORONAS.is_set(),
             no_glare: omsi_cfg::flags::OMSI_NO_GLARE.is_set(),
             debug_fog_lamps: omsi_cfg::flags::OMSI_DEBUG_FOG_LAMPS.is_set(),

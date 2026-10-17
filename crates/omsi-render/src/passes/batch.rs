@@ -3,6 +3,15 @@
 
 use super::*;
 
+fn sort_blended_draws(keyed: &mut [(u8, f32, usize)], draw_order: impl Fn(usize) -> u64) {
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.1.total_cmp(&a.1))
+            .then_with(|| draw_order(a.2).cmp(&draw_order(b.2)))
+            .then(a.2.cmp(&b.2))
+    });
+}
+
 /// The batches of the camera's passes (the shadow casters' are planned apart, see
 /// `plan_shadow_casters`).
 pub(crate) struct DrawPlan {
@@ -12,6 +21,7 @@ pub(crate) struct DrawPlan {
     /// the blended (and, drawn in model order, all) slots of the vehicle the camera is in
     pub cab_batches: Vec<Batch>,
     pub prepass_batches: Vec<Batch>,
+    pub prefill: Option<Vec<Batch>>,
     pub msaa_safe_batches: Vec<Batch>,
     pub presurface_batch_end: usize,
     /// the rain films on the panes, drawn over the finished picture (see `glass_on`)
@@ -22,6 +32,10 @@ pub(crate) struct DrawPlan {
 }
 
 impl DrawPlan {
+    pub(crate) fn prefill_batches(&self) -> &[Batch] {
+        self.prefill.as_deref().unwrap_or(&self.prepass_batches)
+    }
+
     /// Depth prefilling is shared by bundle planning and pass encoding so neither can
     /// omit the excavation prefix unless it will actually be drawn separately.
     pub(crate) fn msaa_prepass(&self, renderer: &Renderer, f: &FrameCtx) -> bool {
@@ -30,10 +44,10 @@ impl DrawPlan {
         let remaining = if self.has_presurface { &self.main_batches[self.presurface_batch_end..] } else { &self.main_batches };
         let needs = !cfg!(target_vendor = "apple") || remaining.iter().chain(&self.cab_batches)
             .any(|b| matches!(b.pipe / 4, PIPE_ALPHA_TEST | PIPE_BLEND | PIPE_BLEND_NO_WRITE));
+        let single = renderer.options.msaa <= 1;
         renderer.prepass_msaa_pipelines.is_some()
-            && (!self.has_presurface || renderer.presurface_msaa_pipelines.is_some())
-            && f.enhanced && (f.with_overlays || f.xr_view) && renderer.options.msaa > 1
-            && (!self.has_presurface || self.msaa_safe_batches.iter().any(|b| b.pipe / 2 != PIPE_ALPHA_TEST))
+            && f.enhanced && (f.with_overlays || f.xr_view) && (!single || (self.has_presurface && cfg!(target_vendor = "apple")))
+            && (!self.has_presurface || self.msaa_safe_batches.iter().any(|b| single || b.pipe / 2 != PIPE_ALPHA_TEST))
             && f.prepass_on && needs && !f.env.no_msaa_prepass
     }
 
@@ -54,19 +68,34 @@ impl DrawPlan {
 }
 
 // the depth prepass: opaque and alpha-tested, single-sampled
-fn prepass_items(scene: &Scene, visible: &[(usize, f32, bool)], deferred: bool) -> (Vec<u32>, Vec<Batch>, Vec<Batch>) {
+fn prepass_items(scene: &Scene, visible: &[(usize, f32, bool)], deferred: bool) -> (Vec<u32>, Vec<Batch>, Option<Vec<Batch>>, Vec<Batch>) {
     let mut items: Vec<DrawItem> = Vec::new();
+    let mut kept: Vec<DrawItem> = Vec::new();
+    let mut any_cut = false;
     let mut list: Vec<u32> = Vec::new();
     let mut batches: Vec<Batch> = Vec::new();
     let mut safe_items = Vec::new();
     let mut safe_batches = Vec::new();
+    let first_panes = first_depth_panes(scene, visible);
     for &(i, _, _) in visible {
         let inst = &scene.instances[i];
+        let mut cut = inst.ordered && first_panes.get(&origin_key(inst.origin)).is_some_and(|&o| inst.draw_order > o);
         let cull = culls_back_faces(scene, inst);
         for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate() {
             let mat_id = inst.materials.get(*slot as usize).copied().unwrap_or(0);
             let mat = &scene.materials[mat_id];
             let kind = kind_of(mat.alpha);
+            // A model drawn in its own order: an opaque part that a depth-writing pane
+            // before it hides (a scroll box's line under its invisible cover) put its depth
+            // here, kept the wall behind it from being drawn, and then failed against the
+            // pane itself - a hole of the clear colour (#2059). So its parts after the first
+            // such pane stay out of the prepass; the ones before it go in as any model's.
+            // (0.2.46 left the whole model out: a bus with its glass listed early lost its
+            // body from the depth that the ambient occlusion and the sun's glare read - no
+            // contact shadow under it, the glare and the passengers through its roof.)
+            if inst.ordered && blend_writes_depth(mat) {
+                cut = true;
+            }
             // Ground blends compose before they may occlude later scenery.
             // The transmap body prepass is for ordinary meshes, not these
             // authored surface layers (including their terrain brush masks).
@@ -86,16 +115,47 @@ fn prepass_items(scene: &Scene, visible: &[(usize, f32, bool)], deferred: bool) 
                     entry: inst.base + *slot,
                 };
                 // Ground must finish composing before its coverage can occlude later layers.
-                if deferred && effective_render_phase(inst) as u8 >= RenderPhase::BeforeNormal as u8 {
+                if !cut && deferred && effective_render_phase(inst) as u8 >= RenderPhase::BeforeNormal as u8 {
                     safe_items.push(item);
+                }
+                if cut {
+                    any_cut = true;
+                } else {
+                    kept.push(item);
                 }
                 items.push(item);
             }
         }
     }
     batch_items(scene, &mut items, true, &mut list, &mut batches);
+    let prefill = any_cut.then(|| {
+        let mut prefill = Vec::new();
+        batch_items(scene, &mut kept, true, &mut list, &mut prefill);
+        prefill
+    });
     batch_items(scene, &mut safe_items, true, &mut list, &mut safe_batches);
-    (list, batches, safe_batches)
+    (list, batches, prefill, safe_batches)
+}
+
+fn blend_writes_depth(mat: &Material) -> bool {
+    mat.alpha == AlphaMode::Blend && (!mat.no_z_write || mat.writes_depth) && !mat.no_z_check
+}
+
+fn first_depth_panes(scene: &Scene, visible: &[(usize, f32, bool)]) -> HashMap<[u64; 3], u64> {
+    let mut first: HashMap<[u64; 3], u64> = HashMap::new();
+    for &(i, _, _) in visible {
+        let inst = &scene.instances[i];
+        if !inst.ordered {
+            continue;
+        }
+        let pane = scene.meshes[inst.mesh].ranges.iter().any(|(_, _, slot)| {
+            blend_writes_depth(&scene.materials[inst.materials.get(*slot as usize).copied().unwrap_or(0)])
+        });
+        if pane {
+            first.entry(origin_key(inst.origin)).and_modify(|o| *o = (*o).min(inst.draw_order)).or_insert(inst.draw_order);
+        }
+    }
+    first
 }
 
 /// The surfaces' covered ground pixels committed to depth, before the normal phase.
@@ -248,8 +308,9 @@ impl Renderer {
         let mut items: Vec<DrawItem> = Vec::new();
         let has_presurface = visible.iter().any(|&(i, _, _)| scene.instances[i].presurface);
         let mut prepass_batches: Vec<Batch> = Vec::new();
+        let mut prefill = None;
         let mut msaa_safe_batches = Vec::new();
-        let deferred = has_presurface && f.enhanced && self.options.msaa > 1;
+        let deferred = has_presurface && f.enhanced;
         let prepass_job = || { prepass_items(scene, visible, deferred) };
         // The main pass follows the authored world phases. Each phase keeps its
         // opaque/cutout draws followed by its blended draws, far to near. Transparent
@@ -265,13 +326,23 @@ impl Renderer {
         // Keep mesh/material order here: an excavation's floor is drawn before its
         // invisible cover writes depth. Sorting its blended cover after the terrain
         // leaves the terrain's colour in place even though the cover writes depth.
-        let mut prepass_found = None;
+        // The prepass's batches are planned beside the main pass's on a worker - or by this
+        // thread itself when it is done with the main pass first and no worker has taken
+        // them up yet: it never waits for a job no one started (a worker the system had not
+        // got round to held up the whole frame).
+        let prepass_found = std::sync::Mutex::new(None);
+        let prepass_taken = std::sync::atomic::AtomicBool::new(!prepass_on);
+        let take_prepass = || {
+            if !prepass_taken.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let found = prepass_job();
+                *prepass_found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+            }
+        };
         let pool = self.encoding_pool.as_ref();
         in_scope(pool, |scope| {
             if prepass_on {
-                let job = &prepass_job;
-                let slot = &mut prepass_found;
-                scope.spawn(move |_| *slot = Some(job()));
+                let take = &take_prepass;
+                scope.spawn(move |_| take());
             }
             let mut by_phase: [Vec<(usize, f32, bool)>; RenderPhase::COUNT] =
                 std::array::from_fn(|_| Vec::new());
@@ -316,14 +387,16 @@ impl Renderer {
             // (see `cab_batches` in the main pass).
             main_draws[1] += cab_items.len();
             batch_items(scene, &mut cab_items, false, list, &mut cab_batches);
+            take_prepass();
         });
-        if let Some((pre_list, mut pre_batches, mut safe_batches)) = prepass_found {
+        if let Some((pre_list, mut pre_batches, mut pre_prefill, mut safe_batches)) = prepass_found.into_inner().unwrap_or_else(|e| e.into_inner()) {
             let offset = list.len() as u32;
-            for b in pre_batches.iter_mut().chain(&mut safe_batches) {
+            for b in pre_batches.iter_mut().chain(pre_prefill.iter_mut().flatten()).chain(&mut safe_batches) {
                 b.instances = b.instances.start + offset..b.instances.end + offset;
             }
             list.extend(pre_list);
             prepass_batches = pre_batches;
+            prefill = pre_prefill;
             msaa_safe_batches = safe_batches;
         }
         // OMSI_SKIP_PIPE=3,1: leave pipeline kinds out of the main pass (0 opaque, 1 alpha
@@ -344,7 +417,7 @@ impl Renderer {
         if f.env.debug_draws {
             log::info!("  main pass: {} opaque/alpha-tested and {} blended draws in {} batches; prepass {} batches; draw list {} entries", main_draws[0], main_draws[1], main_batches.len(), prepass_batches.len(), list.len());
         }
-        DrawPlan { list: draw_list, main_batches, cab_batches, prepass_batches, msaa_safe_batches, presurface_batch_end, rain_batches: Vec::new(), main_draws, has_presurface }
+        DrawPlan { list: draw_list, main_batches, cab_batches, prepass_batches, prefill, msaa_safe_batches, presurface_batch_end, rain_batches: Vec::new(), main_draws, has_presurface }
     }
 
     /// The order a phase's blended draws are drawn in: (rank, distance, instance), far
@@ -460,13 +533,19 @@ impl Renderer {
         // (a total order even where a distance is NaN - an instance at a NaN position:
         // partial_cmp's "equal" for it broke the sort's order, and since Rust 1.81 the
         // sort panics on that, which ended the game)
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+        // AI meshes reuse slots from separate pools by material-slot count. Their ids
+        // can put display glass between two text rows; keep the model's creation order.
+        sort_blended_draws(&mut keyed, |i| scene.instances[i].draw_order);
         keyed
     }
 
     /// OMSI_PROFILE: the frame's counts, and every ten seconds what each asset costs.
     pub(crate) fn count_draws(&mut self, scene: &Scene, with_overlays: bool, visible: usize, plan: &DrawPlan, shadow_batches: &[Vec<Batch>; SHADOW_LISTS]) {
         let DrawPlan { main_batches, prepass_batches, main_draws, .. } = plan;
+        if with_overlays {
+            self.frame_draws.0 += main_batches.len() + prepass_batches.len() + shadow_batches.iter().map(Vec::len).sum::<usize>();
+            self.frame_draws.1 += visible;
+        }
         if self.profiling && !with_overlays {
             let mut c = self.counts.borrow_mut();
             *c.entry("mirror pictures").or_default() += 1.0;
@@ -481,6 +560,16 @@ impl Renderer {
             *c.entry("opaque draws").or_default() += main_draws[0] as f64;
             *c.entry("blended draws").or_default() += main_draws[1] as f64;
             *c.entry("main batches").or_default() += main_batches.len() as f64;
+            *c.entry("presurface views").or_default() += plan.has_presurface as u8 as f64;
+            *c.entry("terrain paint batches").or_default() += main_batches.iter().filter(|b| b.pipe / 4 == PIPE_TERRAIN_PAINT).count() as f64;
+            // the state the main pass's bundles set (each part starts afresh), and what an
+            // order by material within the opaque runs would set instead
+            let (pipes, binds) = state_changes(&bundle_chunks(self.encoding_pool.as_ref(), main_batches));
+            *c.entry("main pipeline switches").or_default() += pipes as f64;
+            *c.entry("main material binds").or_default() += binds as f64;
+            let (pipes_m, binds_m) = state_changes_by_material(main_batches);
+            *c.entry("main pipeline switches by material").or_default() += pipes_m as f64;
+            *c.entry("main material binds by material").or_default() += binds_m as f64;
             *c.entry("prepass batches").or_default() += prepass_batches.len() as f64;
             *c.entry("shadow batches").or_default() +=
                 (shadow_batches[0].len() + shadow_batches[1].len()) as f64;
@@ -526,18 +615,182 @@ impl Renderer {
         if !f.env.no_bundles {
             let pp = self.main_pass(f.enhanced, f.reflection_frame);
             let format = if f.masked_frame { HDR_FORMAT } else { self.format };
-            record_bundles(
-                &self.device,
-                self.encoding_pool.as_ref(),
-                scene,
-                if plan.presurface_prefill(self, f) { &plan.main_batches[plan.presurface_batch_end..] } else { &plan.main_batches },
-                pp,
-                scene.camera_bind_group.as_ref().expect("camera bind group"),
-                format,
-                self.options.msaa,
-            )
+            let batches = if plan.presurface_prefill(self, f) { &plan.main_batches[plan.presurface_batch_end..] } else { &plan.main_batches };
+            let camera = scene.camera_bind_group.as_ref().expect("camera bind group");
+            // The window's bundles of the last frame are drawn again where this frame's
+            // batches are the same and name the same buffers and bind groups: a bundle holds
+            // only which draws to make, and what the draws read (the instances' places, the
+            // draw list) is in buffers written every frame. A view standing still - the bus
+            // at a stop - recorded the same thousand draws anew every frame. This goes by
+            // part: when only the last parts changed (the blended draws, re-sorted as the
+            // traffic moves, come last), the parts before them are kept.
+            // The mirrors' the same, each its own (by its picture's texture): two or three
+            // mirror pictures a frame recorded some 1.5 ms of bundles each.
+            let kept = f.with_overlays && f.projection.is_none() && !f.second_eye;
+            let mirror = (!f.with_overlays && !f.second_eye).then_some(f.exclude_texture).flatten();
+            let mode = (f.enhanced, f.reflection_frame, format, self.options.msaa, rt_gbuf());
+            let chunks = bundle_chunks(self.encoding_pool.as_ref(), batches);
+            let mut reuse: Vec<Option<wgpu::RenderBundle>> = vec![None; chunks.len()];
+            let mirrors = self.history.mirror_bundles.borrow();
+            let window = kept.then(|| self.history.main_bundles.borrow());
+            let last = match &window {
+                Some(w) => w.as_ref(),
+                None => mirror.and_then(|t| mirrors.iter().find(|m| m.0 == t).map(|m| &m.1)),
+            };
+            {
+                if let Some(c) = last {
+                    if c.mode == mode && c.camera == *camera {
+                        for (k, chunk) in chunks.iter().enumerate() {
+                            if let Some((b, r, bundle)) = c.parts.get(k) {
+                                if *b == **chunk && same_resources(scene, chunk, r) {
+                                    reuse[k] = Some(bundle.clone());
+                                }
+                            }
+                        }
+                        if reuse.iter().all(Option::is_some) && c.parts.len() == chunks.len() {
+                            if kept {
+                                self.history.bundle_stats.set((0, reuse.len()));
+                            }
+                            return reuse.into_iter().flatten().collect();
+                        }
+                    }
+                }
+            }
+            let kept_parts = reuse.iter().filter(|b| b.is_some()).count();
+            if f.with_overlays {
+                self.history.bundle_stats.set((chunks.len() - kept_parts, kept_parts));
+            }
+            let bundles = record_bundles(&self.device, self.encoding_pool.as_ref(), scene, &chunks, &reuse, pp, camera, format, self.options.msaa);
+            // (not when a part could not be recorded: it would be left out frame after frame;
+            // and a mirror's or an eye's picture leaves the window's alone - it cleared them,
+            // so with the mirrors on the window never kept a bundle)
+            drop((window, mirrors));
+            let whole = bundles.iter().all(Option::is_some);
+            let made = || MainBundles {
+                mode,
+                camera: camera.clone(),
+                parts: chunks
+                    .iter()
+                    .zip(&bundles)
+                    .map(|(chunk, b)| (chunk.to_vec(), batch_resources(scene, chunk), b.clone().expect("whole")))
+                    .collect(),
+            };
+            if kept {
+                *self.history.main_bundles.borrow_mut() = whole.then(made);
+            } else if let Some(t) = mirror {
+                let mut mirrors = self.history.mirror_bundles.borrow_mut();
+                mirrors.retain(|m| m.0 != t);
+                if whole {
+                    // (a few: a bus has some mirrors, and a texture of one gone stays no longer
+                    // than it takes the others to come round)
+                    if mirrors.len() >= 8 {
+                        mirrors.remove(0);
+                    }
+                    mirrors.push((t, made()));
+                }
+            }
+            bundles.into_iter().flatten().collect()
         } else {
             Vec::new()
         }
+    }
+}
+
+/// The window's main-pass bundles as last recorded and what they were recorded from.
+pub(crate) struct MainBundles {
+    mode: (bool, bool, wgpu::TextureFormat, u32, bool),
+    camera: wgpu::BindGroup,
+    /// each bundle with the batches it was recorded from and what they bound
+    parts: Vec<(Vec<Batch>, Vec<BatchResources>, wgpu::RenderBundle)>,
+}
+
+/// What a recorded batch binds: its mesh's buffers and place in them, and its material's
+/// bind group (a mesh or material slot can be given to another since).
+#[derive(PartialEq)]
+struct BatchResources(wgpu::Buffer, wgpu::Buffer, i32, u32, wgpu::BindGroup);
+
+fn batch_resource<'s>(scene: &'s Scene, b: &Batch) -> (&'s wgpu::Buffer, &'s wgpu::Buffer, i32, u32, &'s wgpu::BindGroup) {
+    let m = &scene.meshes[b.mesh as usize];
+    (&m.vertex_buf, &m.index_buf, m.base_vertex, m.first_index, &scene.materials[b.material as usize].bind_group)
+}
+
+fn batch_resources(scene: &Scene, batches: &[Batch]) -> Vec<BatchResources> {
+    batches
+        .iter()
+        .map(|b| {
+            let (v, i, base, first, bg) = batch_resource(scene, b);
+            BatchResources(v.clone(), i.clone(), base, first, bg.clone())
+        })
+        .collect()
+}
+
+fn same_resources(scene: &Scene, batches: &[Batch], kept: &[BatchResources]) -> bool {
+    batches.len() == kept.len()
+        && batches.iter().zip(kept).all(|(b, k)| {
+            let (v, i, base, first, bg) = batch_resource(scene, b);
+            *v == k.0 && *i == k.1 && base == k.2 && first == k.3 && *bg == k.4
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_blended_draws;
+    use crate::{AlphaMode, MeshData, RenderOptions, Renderer};
+    use glam::{DVec3, Mat4, Vec3};
+
+    #[test]
+    fn state_changes_count_what_the_encoder_sets() {
+        use crate::frame_plan::{state_changes, state_changes_by_material, Batch};
+        let b = |pipe: u8, material: u32| Batch { pipe, mesh: 0, first: 0, count: 3, material, instances: 0..1 };
+        // opaque culled (pipe 2) and not culled (pipe 0) of two looks, then a blended one
+        let batches = [b(0, 1), b(0, 2), b(2, 1), b(2, 2), b(8, 1)];
+        assert_eq!(state_changes(&[&batches]), (3, 5));
+        // two parts: each sets its own state
+        assert_eq!(state_changes(&[&batches[..3], &batches[3..]]), (4, 5));
+        // by material: 1 1 2 2 then blended 1 - fewer binds, more pipeline switches
+        assert_eq!(state_changes_by_material(&batches), (5, 3));
+    }
+
+    #[test]
+    fn recycled_display_layers_keep_model_order_after_distance_and_camera_rank() {
+        // Glass (three material slots) reused id 1; the text rows (one slot each)
+        // reused ids 0 and 2. Slot order would tint only the upper row.
+        let order = [11, 10, 12, 13, 14];
+        let mut draws = vec![(0, 5.0, 2), (2, 20.0, 4), (0, 5.0, 0), (0, 9.0, 3), (0, 5.0, 1)];
+        sort_blended_draws(&mut draws, |i| order[i]);
+        assert_eq!(draws.iter().map(|d| d.2).collect::<Vec<_>>(), vec![3, 1, 0, 2, 4]);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn recycled_instances_sort_by_new_model_creation_order() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Blend, [1.0; 4], true);
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let text = renderer.add_mesh(&mut scene, &data);
+        let glass = renderer.add_mesh(&mut scene, &MeshData {
+            ranges: vec![(0, 3, 0), (0, 3, 1), (0, 3, 2)], ..data
+        });
+        let upper = renderer.add_instance(&mut scene, text, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        let pane = renderer.add_instance(&mut scene, glass, DVec3::ZERO, Mat4::IDENTITY, vec![material; 3]);
+        let lower = renderer.add_instance(&mut scene, text, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        // A new bus creates its glass first, then its two rows, in different slot pools.
+        for (mesh, slots, into) in [(glass, 3, pane), (text, 1, upper), (text, 1, lower)] {
+            renderer.remove_instance(&mut scene, into);
+            let new = renderer.add_instance(&mut scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![material; slots]);
+            assert_eq!(renderer.recycle_instance(&mut scene, new, into), into);
+        }
+        let mut draws = vec![(0, 5.0, upper), (0, 5.0, pane), (0, 5.0, lower)];
+        sort_blended_draws(&mut draws, |i| scene.instances[i].draw_order);
+        assert_eq!(draws.iter().map(|d| d.2).collect::<Vec<_>>(), vec![pane, upper, lower]);
     }
 }
