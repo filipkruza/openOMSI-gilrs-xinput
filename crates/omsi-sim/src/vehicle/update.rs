@@ -154,6 +154,41 @@ impl VehicleInstance {
         self.cabin_air = Some((t, hum, t));
     }
 
+    /// Change cabin temperature once without changing heater controls or coolant.
+    /// Shared-script rear sections read the leading state; independently scripted cars
+    /// need their own temperature and humidity updated too.
+    pub fn set_cabin_temperature(&mut self, temperature: f32) {
+        if !temperature.is_finite() {
+            return;
+        }
+        let humidity = self
+            .ev(Ev::CabinAbsHum)
+            .filter(|h| h.is_finite() && *h >= 0.0)
+            .unwrap_or_else(|| self.cabin_air.map_or(9.0, |(_, h, _)| h));
+        self.set_engine_ev(Ev::CabinTemp, temperature);
+        self.set_engine_ev(Ev::CabinAbsHum, humidity);
+        self.set_engine_ev(Ev::CabinRelHum, relative_humidity(temperature, humidity));
+        self.cabin_air = Some((temperature, humidity, temperature));
+        for part in &mut self.trailers {
+            if let Some(run) = part.run.as_mut() {
+                let humidity = run
+                    .names
+                    .get("cabinair_abshum")
+                    .map(|&id| run.state.vars[id as usize])
+                    .filter(|h| h.is_finite() && *h >= 0.0)
+                    .unwrap_or(humidity);
+                for (name, value) in [
+                    ("cabinair_temp", temperature),
+                    ("cabinair_relhum", relative_humidity(temperature, humidity)),
+                ] {
+                    if let Some(&id) = run.names.get(name) {
+                        run.state.vars[id as usize] = value;
+                    }
+                }
+            }
+        }
+    }
+
     /// Run one simulation frame: physics, scripts, then animations.
     pub fn update(&mut self, dt: f32) {
         self.host.clock.advance(dt);
@@ -166,6 +201,7 @@ impl VehicleInstance {
         self.update_engine_vars(dt);
         crate::timetable_run::apply_pending_destination(self);
         self.apply_scheme_vars_each_frame();
+        self.run_control_cables();
         let p = self.ty.program.clone();
         self.vm.run_frame(&p, &mut self.state, &mut self.host);
         self.show_radio_text();
@@ -190,6 +226,12 @@ impl VehicleInstance {
         }
     }
 
+    pub(super) fn run_control_cables(&mut self) {
+        for &(write, read) in &self.v_cables {
+            self.state.vars[read as usize] = self.state.vars[write as usize];
+        }
+    }
+
     /// Run the scripts' frame once with no time passing (no physics, no clock): what a
     /// switch just pressed makes of the variables the scripts derive from it.
     pub fn update_scripts_only(&mut self, _dt: f32) {
@@ -197,6 +239,7 @@ impl VehicleInstance {
         let p = self.ty.program.clone();
         let gap = self.host.clock.timegap;
         self.host.clock.timegap = 0.0;
+        self.run_control_cables();
         self.vm.run_frame(&p, &mut self.state, &mut self.host);
         self.host.clock.timegap = gap;
     }
@@ -380,6 +423,7 @@ impl VehicleInstance {
         // below, must win over them - its v_font 7 for the Cyrillic font stood reset to the
         // scheme's 0 here, and its display read Latin in the other players' games)
         self.apply_scheme_vars_each_frame();
+        self.run_control_cables();
         for &(id, v) in inputs.iter().chain(pinned) {
             self.put(Some(id), v);
         }
