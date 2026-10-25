@@ -30,13 +30,15 @@ mod pose;
 mod program_ids;
 mod props;
 mod radio;
+mod panto;
+mod rail;
 mod trailer;
 mod trolley;
 mod types;
 mod update;
 mod vars;
 mod visuals;
-mod weather;
+pub(crate) mod weather;
 
 pub use contact::*;
 pub use coupling::*;
@@ -44,8 +46,10 @@ pub use car_run::CarRun;
 #[cfg(test)]
 use drive::*;
 pub use pose::*;
+pub use rail::RailEnv;
 pub use props::*;
 pub use trailer::*;
+pub use panto::{Catenary, PantoGear};
 pub use trolley::TrolleyGear;
 pub use types::*;
 use update::*;
@@ -199,6 +203,10 @@ pub struct VehicleInstance {
     /// out of sight, and the time it missed is made up at once when it comes back. The body,
     /// the coupled parts and the scripts still run every frame.
     pub ai_visuals: bool,
+    /// Seconds between the runs of an AI vehicle's script while it is out of sight and far
+    /// off (0 = every frame): its animations are not drawn, so the script's results wait
+    /// (`TrafficSim::set_visibility`).
+    pub ai_script_period: f32,
     ai_visuals_missed: f32,
     /// The coupled parts were moved on in the traffic's step already (`step_ai_trailers`):
     /// the frame's scripts and animations leave them be.
@@ -229,6 +237,7 @@ pub struct VehicleInstance {
     v_accel: [Option<omsi_script::VarId>; 3],
     v_wheels: Vec<[[Option<omsi_script::VarId>; 5]; 2]>,
     v_springfactor: Vec<[Option<omsi_script::VarId>; 2]>,
+    v_surface: Vec<[Option<omsi_script::VarId>; 2]>,
     /// The passengers' door variables, looked up on first use (see `pax_vars`); made
     /// again when the vehicle gains a variable.
     pax_vars: std::sync::OnceLock<PaxVars>,
@@ -238,4 +247,12 @@ pub struct VehicleInstance {
     program_ids: std::sync::OnceLock<program_ids::ProgramIds>,
     /// A trolleybus's poles and traction (see `trolley`); None for every other vehicle.
     pub trolley: Option<Box<TrolleyGear>>,
+    /// A rail vehicle's pantograph against the wire (see `panto`); None without one.
+    panto: Option<Box<PantoGear>>,
+    /// The track a rail vehicle runs on (see `rail`); None for a road vehicle.
+    rail_env: Option<RailEnv>,
+    /// The vehicle's scripts have driven it (else pedals move it, see `rail`).
+    rail_scripted: bool,
+    rail_out: Option<crate::rail::Outcome>,
+    rail_log: f32,
 }

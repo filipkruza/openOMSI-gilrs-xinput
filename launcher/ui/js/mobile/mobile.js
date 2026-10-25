@@ -11,16 +11,18 @@ import { Icon } from '../icons.js';
 import { Spinner, Toggle, Slider } from '../ui.js';
 import { BusPreview } from '../preview.js';
 import { RouteMap } from '../routemap.js';
-import { choose, curMap, curBus, curLine, curTour, pickedTrip, realTime, realDate, start, weatherName, weatherOfItsOwn, askJoined, noServerBus, mapName, serverBuses, busFile } from '../data.js';
+import { tourId, choose, curMap, curBus, curLine, curTour, pickedTrip, realTime, realDate, start, weatherName, weatherOfItsOwn, askJoined, noServerBus, mapName, serverBuses, busFile } from '../data.js';
 import { hms, mapPicture, tripAt, depotRun, pickTrip, lineMatches, findTours, chooseLine, chooseTour, setSeason, localNow, SEASONS, PHASES, TripEnds, tripTime, weatherFacts, entryName } from '../pages/drive.js';
 import { MultiplayerPage } from '../pages/multiplayer.js';
 import { ProfilePage } from '../pages/profile.js';
 import { ModsPage } from '../pages/mods.js';
+import { TroubleshootPage, problems } from '../pages/troubleshoot.js';
 import { SettingsPage } from '../pages/settings.js';
 import { ControlsPage } from '../pages/controls.js';
 import { GamesPage } from '../pages/games.js';
 import { TutorialsPage } from '../pages/tutorials.js';
 import { SetupPage } from '../pages/setup.js';
+import { AddonsPage } from '../pages/addons.js';
 
 const TABS = [
   ['drive', 'Drive', 'bus'],
@@ -34,12 +36,12 @@ const TABS = [
 export function MobileApp() {
   const s = useStore();
   // (the keys and the game controllers open from Settings, #2308: they fell back to Drive)
-  const page = TABS.some((x) => x[0] === s.page) || ['games', 'tutorials', 'setup', 'controls'].includes(s.page) ? s.page : 'drive';
-  const Body = { drive: MobileDrive, multiplayer: MultiplayerPage, profile: ProfilePage, mods: ModsPage, settings: SettingsPage, more: More, games: GamesPage, tutorials: TutorialsPage, setup: SetupPage, controls: ControlsPage }[page];
+  const page = TABS.some((x) => x[0] === s.page) || ['games', 'tutorials', 'setup', 'controls', 'addons', 'troubleshoot'].includes(s.page) ? s.page : 'drive';
+  const Body = { drive: MobileDrive, multiplayer: MultiplayerPage, profile: ProfilePage, mods: ModsPage, troubleshoot: TroubleshootPage, settings: SettingsPage, more: More, games: GamesPage, tutorials: TutorialsPage, setup: SetupPage, controls: ControlsPage, addons: AddonsPage }[page];
   const running = s.poll.instances?.length || 0;
   return html`<div class="m-shell">
     <nav class="m-rail">
-      ${TABS.map(([id, label, icon]) => html`<button class=${'m-tab' + (page === id || (id === 'more' && ['games', 'tutorials', 'setup'].includes(page)) || (id === 'settings' && page === 'controls') ? ' on' : '')} onClick=${() => set({ page: id })}>
+      ${TABS.map(([id, label, icon]) => html`<button class=${'m-tab' + (page === id || (id === 'more' && ['games', 'tutorials', 'setup', 'addons', 'troubleshoot'].includes(page)) || (id === 'settings' && page === 'controls') ? ' on' : '')} onClick=${() => set({ page: id })}>
         <${Icon} name=${icon} size=${22} /><span>${t(label)}</span>${id === 'more' && running > 0 && html`<i class="m-dot"></i>`}
       </button>`)}
     </nav>
@@ -57,8 +59,10 @@ function More() {
     <h1 class="m-title">${t('More')}</h1>
     <div class="m-group">
       ${item('games', 'Running games', 'gamepad', running ? String(running) : null)}
+      ${item('troubleshoot', 'Troubleshooting', 'alert', problems(s).length ? String(problems(s).length) : null)}
       ${item('tutorials', 'Tutorials', 'book')}
       ${item('setup', 'Setup', 'folder')}
+      ${item('addons', 'Add-ons', 'globe')}
     </div>
     <p class="m-foot">openOMSI ${s.boot?.version || ''}</p>
   </div>`;
@@ -241,7 +245,7 @@ function TourSheet({ close }) {
       const trip = x.trips[at];
       const found = tq && trip && !x.number.toLowerCase().includes(tq);
       const what = found ? html`${hms(trip.departure)} <${TripEnds} trip=${trip} />${via ? ` (${t('via {stop}', { stop: via })})` : ''}` : `${x.days} - ${t('{n} trips', { n: x.trips.length })}${x.trips.length ? ` - ${hms(x.first)}-${hms(x.last)}` : ''}`;
-      return pick(x.number === s.choice.tour, () => (chooseTour(x, found ? trip : null), close()), html`<span class="m-pick-text"><b>${t('Tour')} ${x.number}</b><small>${what}${!x.runs ? ` - ${t('not on this day')}` : ended ? ` - ${t('ended')}` : ''}</small></span>`, x.runs && !ended ? '' : ' dim');
+      return pick(tourId(x) === s.choice.tour, () => (chooseTour(x, found ? trip : null), close()), html`<span class="m-pick-text"><b>${t('Tour')} ${x.number}</b><small>${what}${!x.runs ? ` - ${t('not on this day')}` : ended ? ` - ${t('ended')}` : ''}</small></span>`, x.runs && !ended ? '' : ' dim');
     })}
   </div>`;
 }
