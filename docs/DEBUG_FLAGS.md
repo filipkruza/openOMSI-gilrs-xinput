@@ -175,6 +175,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_DRIVE_PROFILE` | text | - | use | app | Offscreen: "t throttle brake [steer]/..." piecewise constant pedals (crash/kerb tests). |
 | `OMSI_DRIVE_V0` | num | - | use | app | Offscreen: the bus's speed in km/h on the first frame. |
 | `OMSI_FAKE_GPU_ERROR` | text | - | frame | render | Fault injection: open, open-panic, pipeline, lost-build, build, lost, frame, mesh - the GPU error to simulate. Only in builds with omsi-render's `test-hooks` feature (on by default). |
+| `OMSI_FLASHLIGHT` | bool | off | use | app | Offscreen: the player's flashlight is on (in the window it is Alt+F). |
 | `OMSI_FLEET_AHEAD` | num | FLEET_AHEAD | use | app | Minutes ahead the timetable fleet is planned (for tests). |
 | `OMSI_FLEET_IDLE` | num | FLEET_IDLE | use | app | Seconds a fleet vehicle idles (shortened for tests). |
 | `OMSI_FOLLOW_CAM` | text | - | use | app | right,ahead,up,yaw,pitch: a camera in the followed car's frame. |
@@ -266,8 +267,10 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_GPU_ARRAYS` | text | - | use | render | textures, nostorage or lighttextures: take that texture array path on any device. |
 | `OMSI_GUARD_DEADLINE` | num | 120 | use | guard | The start guard: seconds the launcher may take to its first frames before its start counts as hung (it is then ended and the guard heals the installation). |
 | `OMSI_HEIGHTPROFILE_GROUND` | bool | off | once | scene | The wheels stand on the splines' [heightprofile]s again (A/B). |
-| `OMSI_HTML_FALLBACK_FONT` | text | - | use | htmlengine | Font file for the html pages' characters Inter lacks (Hangul, CJK); else Malgun Gothic (Windows) or AppleGothic (macOS). |
-| `OMSI_HTML_FALLBACK_FONT_BOLD` | text | - | use | htmlengine | With OMSI_HTML_FALLBACK_FONT: its bold face. |
+| `OMSI_HTML_ENGINE` | text | classic | use | htmlpage | `modern` runs every [htmltexture] page on the modern engine (flexbox, modern JavaScript) instead of only those that ask with <meta name="omsi-engine" content="modern">; for comparing the two. |
+| `OMSI_HTML_FALLBACK_FONT` | text | - | use | htmlengine, htmlpage | Font file for the html pages' characters Inter lacks (Hangul, CJK); else Malgun Gothic (Windows) or AppleGothic (macOS). |
+| `OMSI_HTML_FALLBACK_FONT_BOLD` | text | - | use | htmlengine, htmlpage | With OMSI_HTML_FALLBACK_FONT: its bold face. |
+| `OMSI_IGNORE_TRANSPORT` | bool | off | use | app | Run a vehicle on a map built for other transport modes (the log still says so). |
 | `OMSI_INTEL_FULL_GPU` | bool | off | use | render | Keep the requested settings on an Intel Vulkan adapter. |
 | `OMSI_KEEP_ALLOCATOR` | bool | off | use | app | Skip the restart that swaps in the faster allocator at start. |
 | `OMSI_LAMP_SHADOWS_EVERY_FRAME` | bool | off | frame | render | Redraw the street lamps' shadow tiles every frame (not only when they change). |
@@ -287,6 +290,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_NO_BUNDLES` | bool | off | frame | render | Record the main pass directly instead of from render bundles. |
 | `OMSI_NO_CABIN_SHADOWS` | bool | off | frame | render | Enhanced: the lamps of the player's saloon cast no shadows (A/B). |
 | `OMSI_NO_CLOUDS` | bool | off | use | app | No clouds. |
+| `OMSI_NO_CLOUD_SHADOW_FIELD` | bool | off | use | render | Enhanced: the clouds' shadow is one number for the whole picture again, not a field over the land (A/B). |
 | `OMSI_NO_CORONAS` | bool | off | frame | render | No light coronas. |
 | `OMSI_NO_CULL` | bool | off | once | render | Draw every mesh from both sides (A/B). |
 | `OMSI_NO_DRAW_ORDER_DEPTH` | bool | off | once | render, scene | An object's surfaces in one plane, and a spline laid on an earlier one at its height, without the draw order's depth step (A/B). |
@@ -297,6 +301,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_NO_GLARE` | bool | off | frame | render | No sun glare. |
 | `OMSI_NO_GLASS_PICTURE` | bool | off | frame | render | No picture behind the glass (rain films). |
 | `OMSI_NO_GROUND_PAINT` | bool | off | use | scene | No painted ground layers. |
+| `OMSI_NO_GROUND_PASS` | bool | off | frame | render | The terrain's paint layers lit one by one again, not laid into one albedo picture first (A/B). |
 | `OMSI_NO_GROUND_SPLINE_BATCHING` | bool | off | use | scene | No batching of ground splines. |
 | `OMSI_NO_GUARD` | bool | off | use | guard, launcher-api | No start guard: a start that crashes or hangs is not healed by an update or by going back to the version before. |
 | `OMSI_NO_HARDWARE_ID` | bool | off | once | lan | LAN: the game sends no hardware identifier (a host can then turn the player away, and cannot ban the machine). |
@@ -330,7 +335,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_NO_SMOKE` | bool | off | frame | render | No smoke. |
 | `OMSI_NO_SNOWFALL` | bool | off | frame | render | No snowfall. |
 | `OMSI_NO_SPLINE_BATCHING` | bool | off | use | scene | No spline batching. |
-| `OMSI_NO_SPLINE_HOLES` | bool | off | use | scene | Splines without hole rims. |
+| `OMSI_NO_SPLINE_HOLES` | bool | off | use | scene | Keep the unfitted terrain mesh beneath aligned splines. |
 | `OMSI_NO_SPRAY` | bool | off | use | app | No tyre spray. |
 | `OMSI_NO_SURF` | bool | off | once | scene | Every road as smooth as before (no surface texture) (A/B). |
 | `OMSI_NO_TEXCOMPRESS` | bool | off | use | render | No runtime texture compression. |
